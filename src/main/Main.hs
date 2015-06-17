@@ -40,6 +40,7 @@ import qualified Stack.Docker as Docker
 import           Stack.Exec
 import           Stack.Fetch
 import           Stack.GhcPkg (getCabalPkgVer)
+import qualified Stack.NewProject                  as NewProject
 import qualified Stack.PackageIndex
 import           Stack.Path
 import           Stack.Setup
@@ -92,8 +93,8 @@ main =
                         buildOpts
              addCommand "new"
                         "Create a brand new project"
-                        (error "new command not yet implemented, check out https://github.com/commercialhaskell/stack/issues/137 for status and to get involved")
-                        (pure ())
+                        newProjectCmd
+                        newProjectCmdOpts
              addCommand "setup"
                         "Get the appropriate ghc for your project"
                         setupCmd
@@ -334,6 +335,12 @@ installCmd :: BuildOpts -> GlobalOpts -> IO ()
 installCmd opts go@GlobalOpts{..} = withBuildConfig go ExecStrategy $
     Stack.Build.build opts { boptsInstallExes = True }
 
+-- | New
+newProjectCmd :: NewProject.NewProjectArgs -> GlobalOpts -> IO ()
+newProjectCmd newArgs go@GlobalOpts{..} = do
+  (manager,_) <- loadConfigWithOpts go
+  runStackLoggingT manager globalLogLevel $ NewProject.create newArgs
+
 -- | Unpack packages to the filesystem
 unpackCmd :: [String] -> GlobalOpts -> IO ()
 unpackCmd names go@GlobalOpts{..} = do
@@ -464,6 +471,17 @@ buildOpts =
         onlySnapshot = flag False True
             (long "only-snapshot" <>
              help "Only build packages for the snapshot database, not the local database")
+-- | Parser for new stack project arguments
+newProjectCmdOpts :: Parser NewProject.NewProjectArgs
+newProjectCmdOpts = NewProject.NewProjectArgs <$> projectName <*> templateName <*> dependencies
+  where projectName = T.pack <$> strArgument (metavar "NAME")
+        templateName = T.pack <$> strOption (metavar "TEMPLATE" <> short 't' <> long "template" <> value "default")
+        dependencies = many (option dependencyReader $ metavar "DEPENDENCY" <> short 'd' <> long "dependency")
+
+        dependencyReader :: ReadM NewProject.NewProjectDependency
+        dependencyReader = do
+          dontAllowVersionOverideYet <- T.pack <$> readerAsk -- TODO: Github issue
+          return $ NewProject.NewProjectDependency dontAllowVersionOverideYet Nothing
 
 -- | Parser for docker cleanup arguments.
 dockerCleanupOpts :: Parser Docker.CleanupOpts
