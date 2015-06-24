@@ -46,6 +46,7 @@ import           Stack.Init
 import           Stack.New
 import qualified Stack.PackageIndex
 import           Stack.Repl
+import           Stack.Ide
 import           Stack.Setup
 import           Stack.Solver (solveExtraDeps)
 import           Stack.Types
@@ -175,6 +176,18 @@ main =
                                                     help "Use this command for the GHC to run"))) <*>
                          flag False True (long "no-load" <>
                                          help "Don't load modules on start-up"))
+             addCommand "ide"
+                        "Run ide-backend-client with the correct arguments"
+                        ideCmd
+                        ((,) <$>
+                         fmap (map T.pack)
+                              (many (strArgument
+                                       (metavar "TARGET" <>
+                                        help "If none specified, use all packages defined in current directory"))) <*>
+                         fmap (fromMaybe [])
+                              (optional (argsOption (long "ghc-options" <>
+                                                     metavar "OPTION" <>
+                                                     help "Additional options passed to GHCi"))))
              addCommand "runghc"
                         "Run runghc"
                         execCmd
@@ -507,10 +520,15 @@ execCmd (cmd,args,envSettings) go@GlobalOpts{..} =
     withBuildConfig go ExecStrategy $
     exec envSettings cmd args
 
--- | Run the REPL in the context of a project, with
+-- | Run the REPL in the context of a project.
 replCmd :: ([Text], [String], FilePath, Bool) -> GlobalOpts -> IO ()
 replCmd (targets,args,path,noload) go@GlobalOpts{..} = withBuildConfig go ExecStrategy $ do
       repl targets args path noload
+
+-- | Run ide-backend in the context of a project.
+ideCmd :: ([Text], [String]) -> GlobalOpts -> IO ()
+ideCmd (targets,args) go@GlobalOpts{..} = withBuildConfig go ExecStrategy $ do
+      ide targets args
 
 -- | Pull the current Docker image.
 dockerPullCmd :: () -> GlobalOpts -> IO ()
