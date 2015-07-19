@@ -29,5 +29,5 @@ RUN git clone https://github.com/drwebb/haskell-stack-git.git -b WIPnocaball
 RUN chown -R aurbuilder:users haskell-stack-git
 # we want to specify the version numbers here I guess
 WORKDIR haskell-stack-git
-RUN su aurbuilder -c makepkg
+RUN su aurbuilder -c makepkg --holdver
 
