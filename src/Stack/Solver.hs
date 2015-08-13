@@ -14,7 +14,7 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Logger
 import           Control.Monad.Reader
 import           Control.Monad.Trans.Control
-import           Data.Aeson                  (object, (.=), toJSON)
+import           Data.Aeson.Extended         (object, (.=), toJSON, logJSONWarnings)
 import qualified Data.ByteString             as S
 import qualified Data.ByteString.Char8       as S8
 import           Data.Either
@@ -38,10 +38,11 @@ import           System.Process.Read
 
 cabalSolver :: (MonadIO m, MonadLogger m, MonadMask m, MonadBaseControl IO m, MonadReader env m, HasConfig env)
             => [Path Abs Dir] -- ^ cabal files
-            -> [String] -- ^ additional arguments, usually constraints
+            -> Map PackageName Version -- ^ constraints
+            -> [String] -- ^ additional arguments
             -> m (MajorVersion, Map PackageName (Version, Map FlagName Bool))
-cabalSolver cabalfps cabalArgs = withSystemTempDirectory "cabal-solver" $ \dir -> do
-    configLines <- getCabalConfig dir
+cabalSolver cabalfps constraints cabalArgs = withSystemTempDirectory "cabal-solver" $ \dir -> do
+    configLines <- getCabalConfig dir constraints
     let configFile = dir FP.</> "cabal.config"
     liftIO $ S.writeFile configFile $ encodeUtf8 $ T.unlines configLines
 
@@ -115,12 +116,13 @@ getGhcMajorVersion menv = do
 
 getCabalConfig :: (MonadReader env m, HasConfig env, MonadIO m, MonadThrow m)
                => FilePath -- ^ temp dir
+               -> Map PackageName Version -- ^ constraints
                -> m [Text]
-getCabalConfig dir = do
+getCabalConfig dir constraints = do
     indices <- asks $ configPackageIndices . getConfig
     remotes <- mapM goIndex indices
     let cache = T.pack $ "remote-repo-cache: " ++ dir
-    return $ cache : remotes
+    return $ cache : remotes ++ map goConstraint (Map.toList constraints)
   where
     goIndex index = do
         src <- configPackageIndex $ indexName index
@@ -135,6 +137,13 @@ getCabalConfig dir = do
             , ":http://0.0.0.0/fake-url"
             ]
 
+    goConstraint (name, version) = T.concat
+        [ "constraint: "
+        , T.pack $ packageNameString name
+        , "=="
+        , T.pack $ versionString version
+        ]
+
 -- | Determine missing extra-deps
 solveExtraDeps :: (MonadReader env m, HasEnvConfig env, MonadIO m, MonadMask m, MonadLogger m, MonadBaseControl IO m, HasHttpManager env)
                => Bool -- ^ modify stack.yaml?
@@ -142,28 +151,24 @@ solveExtraDeps :: (MonadReader env m, HasEnvConfig env, MonadIO m, MonadMask m, 
 solveExtraDeps modStackYaml = do
     $logInfo "This command is not guaranteed to give you a perfect build plan"
     $logInfo "It's possible that even with the changes generated below, you will still need to do some manual tweaking"
+    econfig <- asks getEnvConfig
     bconfig <- asks getBuildConfig
     snapshot <-
         case bcResolver bconfig of
             ResolverSnapshot snapName -> liftM mbpPackages $ loadMiniBuildPlan snapName
             ResolverGhc _ -> return Map.empty
-            ResolverCustom _ url -> liftM mbpPackages $ parseCustomMiniBuildPlan url
+            ResolverCustom _ url -> liftM mbpPackages $ parseCustomMiniBuildPlan
+                (bcStackYaml bconfig)
+                url
 
     let packages = Map.union
             (bcExtraDeps bconfig)
             (fmap mpiVersion snapshot)
-        constraints = map
-            (\(k, v) -> concat
-                [ "--constraint="
-                , packageNameString k
-                , "=="
-                , versionString v
-                ])
-            (Map.toList packages)
 
     (_ghc, extraDeps) <- cabalSolver
-        (Map.keys $ bcPackages bconfig)
-        constraints
+        (Map.keys $ envConfigPackages econfig)
+        packages
+        []
 
     let newDeps = extraDeps `Map.difference` packages
         newFlags = Map.filter (not . Map.null) $ fmap snd newDeps
@@ -181,7 +186,9 @@ solveExtraDeps modStackYaml = do
     when modStackYaml $ do
         let fp = toFilePath $ bcStackYaml bconfig
         obj <- liftIO (Yaml.decodeFileEither fp) >>= either throwM return
-        ProjectAndConfigMonoid project _ <- liftIO (Yaml.decodeFileEither fp) >>= either throwM return
+        (ProjectAndConfigMonoid project _, warnings) <-
+            liftIO (Yaml.decodeFileEither fp) >>= either throwM return
+        logJSONWarnings fp warnings
         let obj' =
                 HashMap.insert "extra-deps"
                     (toJSON $ map fromTuple $ Map.toList

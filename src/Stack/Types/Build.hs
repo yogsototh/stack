@@ -7,23 +7,26 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE ViewPatterns #-}
 
--- | All data types.
+-- | Build-specific types.
 
-module Stack.Build.Types
+module Stack.Types.Build
     (StackBuildException(..)
+    ,FlagSource(..)
+    ,UnusedFlags(..)
     ,InstallLocation(..)
     ,ModTime
     ,modTime
     ,Installed(..)
     ,PackageInstallInfo(..)
     ,Task(..)
+    ,taskLocation
     ,LocalPackage(..)
     ,BaseConfigOpts(..)
     ,Plan(..)
     ,TestOpts(..)
     ,BenchmarkOpts(..)
-    ,FinalAction(..)
     ,BuildOpts(..)
+    ,BuildSubset(..)
     ,defaultBuildOpts
     ,TaskType(..)
     ,TaskConfigOpts(..)
@@ -56,14 +59,18 @@ import           Data.Text.Encoding (decodeUtf8With)
 import           Data.Text.Encoding.Error (lenientDecode)
 import           Data.Time.Calendar
 import           Data.Time.Clock
-import           Data.Word (Word64)
 import           Distribution.System (Arch)
 import           Distribution.Text (display)
 import           GHC.Generics
 import           Path (Path, Abs, File, Dir, mkRelDir, toFilePath, parseRelDir, (</>))
 import           Prelude
-import           Stack.Package
-import           Stack.Types
+import           Stack.Types.FlagName
+import           Stack.Types.GhcPkgId
+import           Stack.Types.Config
+import           Stack.Types.Package
+import           Stack.Types.PackageIdentifier
+import           Stack.Types.PackageName
+import           Stack.Types.Version
 import           System.Exit (ExitCode)
 import           System.FilePath (dropTrailingPathSeparator, pathSeparator)
 
@@ -94,7 +101,17 @@ data StackBuildException
         PackageName
         Version -- local version
         Version -- version specified on command line
+  | NoSetupHsFound (Path Abs Dir)
+  | InvalidFlagSpecification (Set UnusedFlags)
+  | TargetParseException [Text]
   deriving Typeable
+
+data FlagSource = FSCommandLine | FSStackYaml
+    deriving (Show, Eq, Ord)
+
+data UnusedFlags = UFNoPackage FlagSource PackageName
+                 | UFFlagsNotDefined FlagSource Package (Set FlagName)
+    deriving (Show, Eq, Ord)
 
 instance Show StackBuildException where
     show (Couldn'tFindPkgId name) =
@@ -198,7 +215,7 @@ instance Show StackBuildException where
      -- Supressing duplicate output
     show (CabalExitedUnsuccessfully exitCode taskProvides' execName fullArgs logFiles bs) =
         let fullCmd = (dropQuotes (show execName) ++ " " ++ (unwords fullArgs))
-            logLocations = maybe "" (\fp -> "\n    Logs have been written to: " ++ show fp) logFiles
+            logLocations = maybe "" (\fp -> "\n    Logs have been written to: " ++ toFilePath fp) logFiles
         in "\n--  While building package " ++ dropQuotes (show taskProvides') ++ " using:\n" ++
            "      " ++ fullCmd ++ "\n" ++
            "    Process exited with code: " ++ show exitCode ++
@@ -221,6 +238,43 @@ instance Show StackBuildException where
         , versionString requestedV
         , " on the command line"
         ]
+    show (NoSetupHsFound dir) =
+        "No Setup.hs or Setup.lhs file found in " ++ toFilePath dir
+    show (InvalidFlagSpecification unused) = unlines
+        $ "Invalid flag specification:"
+        : map go (Set.toList unused)
+      where
+        showFlagSrc :: FlagSource -> String
+        showFlagSrc FSCommandLine = " (specified on command line)"
+        showFlagSrc FSStackYaml = " (specified in stack.yaml)"
+
+        go :: UnusedFlags -> String
+        go (UFNoPackage src name) = concat
+            [ "- Package '"
+            , packageNameString name
+            , "' not found"
+            , showFlagSrc src
+            ]
+        go (UFFlagsNotDefined src pkg flags) = concat
+            [ "- Package '"
+            , name
+            , "' does not define the following flags"
+            , showFlagSrc src
+            , ":\n"
+            , intercalate "\n"
+                          (map (\flag -> "  " ++ flagNameString flag)
+                               (Set.toList flags))
+            , "\n- Flags defined by package '" ++ name ++ "':\n"
+            , intercalate "\n"
+                          (map (\flag -> "  " ++ name ++ ":" ++ flagNameString flag)
+                               (Set.toList pkgFlags))
+            ]
+          where name = packageNameString (packageName pkg)
+                pkgFlags = packageDefinedFlags pkg
+    show (TargetParseException [err]) = "Error parsing targets: " ++ T.unpack err
+    show (TargetParseException errs) = unlines
+        $ "The following errors occurred while parsing the build targets:"
+        : map (("- " ++) . T.unpack) errs
 
 instance Exception StackBuildException
 
@@ -286,6 +340,15 @@ instance Show ConstructPlanException where
 
 ----------------------------------------------
 
+-- | Which subset of packages to build
+data BuildSubset
+    = BSAll
+    | BSOnlySnapshot
+    -- ^ Only install packages in the snapshot database, skipping
+    -- packages intended for the local database.
+    | BSOnlyDependencies
+    deriving Show
+
 -- | Configuration for building.
 data BuildOpts =
   BuildOpts {boptsTargets :: ![Text]
@@ -296,7 +359,6 @@ data BuildOpts =
             -- ^ Build haddocks?
             ,boptsHaddockDeps :: !(Maybe Bool)
             -- ^ Build haddocks for dependencies?
-            ,boptsFinalAction :: !FinalAction
             ,boptsDryrun :: !Bool
             ,boptsGhcOptions :: ![Text]
             ,boptsFlags :: !(Map (Maybe PackageName) (Map FlagName Bool))
@@ -304,15 +366,25 @@ data BuildOpts =
             -- ^ Install executables to user path after building?
             ,boptsPreFetch :: !Bool
             -- ^ Fetch all packages immediately
-            ,boptsOnlySnapshot :: !Bool
-            -- ^ Only install packages in the snapshot database, skipping
-            -- packages intended for the local database.
+            ,boptsBuildSubset :: !BuildSubset
             ,boptsFileWatch :: !Bool
             -- ^ Watch files for changes and automatically rebuild
             ,boptsKeepGoing :: !(Maybe Bool)
             -- ^ Keep building/running after failure
             ,boptsForceDirty :: !Bool
             -- ^ Force treating all local packages as having dirty files
+
+            ,boptsTests :: !Bool
+            -- ^ Turn on tests for local targets
+            ,boptsTestOpts :: !TestOpts
+            -- ^ Additional test arguments
+
+            ,boptsBenchmarks :: !Bool
+            -- ^ Turn on benchmarks for local targets
+            ,boptsBenchmarkOpts :: !BenchmarkOpts
+            -- ^ Additional test arguments
+            ,boptsExec :: ![(String, [String])]
+            -- ^ Commands (with arguments) to run after a successful build
             }
   deriving (Show)
 
@@ -324,16 +396,20 @@ defaultBuildOpts = BuildOpts
     , boptsEnableOptimizations = Nothing
     , boptsHaddock = False
     , boptsHaddockDeps = Nothing
-    , boptsFinalAction = DoNothing
     , boptsDryrun = False
     , boptsGhcOptions = []
     , boptsFlags = Map.empty
     , boptsInstallExes = False
     , boptsPreFetch = False
-    , boptsOnlySnapshot = False
+    , boptsBuildSubset = BSAll
     , boptsFileWatch = False
     , boptsKeepGoing = Nothing
     , boptsForceDirty = False
+    , boptsTests = False
+    , boptsTestOpts = defaultTestOpts
+    , boptsBenchmarks = False
+    , boptsBenchmarkOpts = defaultBenchmarkOpts
+    , boptsExec = []
     }
 
 -- | Options for the 'FinalAction' 'DoTests'
@@ -344,51 +420,28 @@ data TestOpts =
            ,toDisableRun :: !Bool -- ^ Disable running of tests
            } deriving (Eq,Show)
 
+defaultTestOpts :: TestOpts
+defaultTestOpts = TestOpts
+    { toRerunTests = True
+    , toAdditionalArgs = []
+    , toCoverage = False
+    , toDisableRun = False
+    }
+
 -- | Options for the 'FinalAction' 'DoBenchmarks'
 data BenchmarkOpts =
   BenchmarkOpts {beoAdditionalArgs :: !(Maybe String) -- ^ Arguments passed to the benchmark program
                 } deriving (Eq,Show)
 
--- | Run a Setup.hs action after building a package, before installing.
-data FinalAction
-  = DoTests TestOpts
-  | DoBenchmarks BenchmarkOpts
-  | DoNothing
-  deriving (Eq,Show)
+defaultBenchmarkOpts :: BenchmarkOpts
+defaultBenchmarkOpts = BenchmarkOpts
+    { beoAdditionalArgs = Nothing
+    }
 
 -- | Package dependency oracle.
 newtype PkgDepsOracle =
     PkgDeps PackageName
     deriving (Show,Typeable,Eq,Hashable,Binary,NFData)
-
--- | A location to install a package into, either snapshot or local
-data InstallLocation = Snap | Local
-    deriving (Show, Eq)
-instance Monoid InstallLocation where
-    mempty = Snap
-    mappend Local _ = Local
-    mappend _ Local = Local
-    mappend Snap Snap = Snap
-
--- | Datatype which tells how which version of a package to install and where
--- to install it into
-class PackageInstallInfo a where
-    piiVersion :: a -> Version
-    piiLocation :: a -> InstallLocation
-
--- | Information on a locally available package of source code
-data LocalPackage = LocalPackage
-    { lpPackage        :: !Package         -- ^ The @Package@ info itself, after resolution with package flags, not including any final actions
-    , lpPackageFinal   :: !Package         -- ^ Same as lpPackage, but with any test suites or benchmarks enabled as necessary
-    , lpWanted         :: !Bool            -- ^ Is this package a \"wanted\" target based on command line input
-    , lpDir            :: !(Path Abs Dir)  -- ^ Directory of the package.
-    , lpCabalFile      :: !(Path Abs File) -- ^ The .cabal file
-    , lpDirtyFiles     :: !Bool            -- ^ are there files that have changed since the last build?
-    , lpNewBuildCache  :: !(Map FilePath FileCacheInfo) -- ^ current state of the files
-    , lpFiles          :: !(Set (Path Abs File)) -- ^ all files used by this package
-    , lpComponents     :: !(Set Text)      -- ^ components to build, passed directly to Setup.hs build
-    }
-    deriving Show
 
 -- | Stored on disk to know whether the flags have changed or any
 -- files have changed.
@@ -442,10 +495,16 @@ data TaskType = TTLocal LocalPackage
               | TTUpstream Package InstallLocation
     deriving Show
 
+taskLocation :: Task -> InstallLocation
+taskLocation task =
+    case taskType task of
+        TTLocal _ -> Local
+        TTUpstream _ loc -> loc
+
 -- | A complete plan of what needs to be built and how to do it
 data Plan = Plan
     { planTasks :: !(Map PackageName Task)
-    , planFinals :: !(Map PackageName Task)
+    , planFinals :: !(Map PackageName (Task, LocalPackageTB))
     -- ^ Final actions to be taken (test, benchmark, etc)
     , planUnregisterLocal :: !(Map GhcPkgId Text)
     -- ^ Text is reason we're unregistering, for display only
@@ -505,8 +564,8 @@ configureOpts econfig bco deps wanted loc package = map T.pack $ concat
     toFilePathNoTrailingSlash = dropTrailingPathSeparator . toFilePath
     docDir =
         case pkgVerDir of
-            Nothing -> installRoot </> docdirSuffix
-            Just dir -> installRoot </> docdirSuffix </> dir
+            Nothing -> installRoot </> docDirSuffix
+            Just dir -> installRoot </> docDirSuffix </> dir
     installRoot =
         case loc of
             Snap -> bcoSnapInstallRoot bco
@@ -543,10 +602,6 @@ configureOpts econfig bco deps wanted loc package = map T.pack $ concat
 wantedLocalPackages :: [LocalPackage] -> Set PackageName
 wantedLocalPackages = Set.fromList . map (packageName . lpPackage) . filter lpWanted
 
--- | Used for storage and comparison.
-newtype ModTime = ModTime (Integer,Rational)
-  deriving (Ord,Show,Generic,Eq,NFData,Binary)
-
 -- | One-way conversion to serialized time.
 modTime :: UTCTime -> ModTime
 modTime x =
@@ -558,13 +613,3 @@ modTime x =
 
 data Installed = Library GhcPkgId | Executable PackageIdentifier
     deriving (Show, Eq, Ord)
-
-data FileCacheInfo = FileCacheInfo
-    { fciModTime :: !ModTime
-    , fciSize :: !Word64
-    , fciHash :: !S.ByteString
-    }
-    deriving (Generic, Show)
-instance Binary FileCacheInfo
-instance NFData FileCacheInfo where
-    rnf = genericRnf

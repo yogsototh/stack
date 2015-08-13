@@ -36,8 +36,6 @@ data DockerOpts = DockerOpts
     -- ^ Arguments to pass directly to @docker run@.
   ,dockerMount :: ![Mount]
     -- ^ Volumes to mount in the container.
-  ,dockerPassHost :: !Bool
-    -- ^ Pass Docker daemon connection information into container.
   ,dockerDatabasePath :: !(Path Abs File)
     -- ^ Location of image usage database.
   }
@@ -72,32 +70,29 @@ data DockerOptsMonoid = DockerOptsMonoid
     -- ^ Arguments to pass directly to @docker run@
   ,dockerMonoidMount :: ![Mount]
     -- ^ Volumes to mount in the container
-  ,dockerMonoidPassHost :: !(Maybe Bool)
-    -- ^ Pass Docker daemon connection information into container.
   ,dockerMonoidDatabasePath :: !(Maybe String)
     -- ^ Location of image usage database.
   }
   deriving (Show)
 
 -- | Decode uninterpreted docker options from JSON/YAML.
-instance FromJSON DockerOptsMonoid where
-  parseJSON = withObject "DockerOptsMonoid"
+instance FromJSON (DockerOptsMonoid, [JSONWarning]) where
+  parseJSON = withObjectWarnings "DockerOptsMonoid"
     (\o -> do dockerMonoidExists           <- pure (Just True)
-              dockerMonoidEnable           <- o .:? dockerEnableArgName
-              dockerMonoidRepoOrImage      <- ((Just . DockerMonoidImage) <$> o .: dockerImageArgName) <|>
-                                              ((Just . DockerMonoidRepo) <$> o .: dockerRepoArgName) <|>
+              dockerMonoidEnable           <- o ..:? dockerEnableArgName
+              dockerMonoidRepoOrImage      <- ((Just . DockerMonoidImage) <$> o ..: dockerImageArgName) <|>
+                                              ((Just . DockerMonoidRepo) <$> o ..: dockerRepoArgName) <|>
                                               pure Nothing
-              dockerMonoidRegistryLogin    <- o .:? dockerRegistryLoginArgName
-              dockerMonoidRegistryUsername <- o .:? dockerRegistryUsernameArgName
-              dockerMonoidRegistryPassword <- o .:? dockerRegistryPasswordArgName
-              dockerMonoidAutoPull         <- o .:? dockerAutoPullArgName
-              dockerMonoidDetach           <- o .:? dockerDetachArgName
-              dockerMonoidPersist          <- o .:? dockerPersistArgName
-              dockerMonoidContainerName    <- o .:? dockerContainerNameArgName
-              dockerMonoidRunArgs          <- o .:? dockerRunArgsArgName .!= []
-              dockerMonoidMount            <- o .:? dockerMountArgName .!= []
-              dockerMonoidPassHost         <- o .:? dockerPassHostArgName
-              dockerMonoidDatabasePath     <- o .:? dockerDatabasePathArgName
+              dockerMonoidRegistryLogin    <- o ..:? dockerRegistryLoginArgName
+              dockerMonoidRegistryUsername <- o ..:? dockerRegistryUsernameArgName
+              dockerMonoidRegistryPassword <- o ..:? dockerRegistryPasswordArgName
+              dockerMonoidAutoPull         <- o ..:? dockerAutoPullArgName
+              dockerMonoidDetach           <- o ..:? dockerDetachArgName
+              dockerMonoidPersist          <- o ..:? dockerPersistArgName
+              dockerMonoidContainerName    <- o ..:? dockerContainerNameArgName
+              dockerMonoidRunArgs          <- o ..:? dockerRunArgsArgName ..!= []
+              dockerMonoidMount            <- o ..:? dockerMountArgName ..!= []
+              dockerMonoidDatabasePath     <- o ..:? dockerDatabasePathArgName
               return DockerOptsMonoid{..})
 
 -- | Left-biased combine Docker options
@@ -115,7 +110,6 @@ instance Monoid DockerOptsMonoid where
     ,dockerMonoidContainerName    = Nothing
     ,dockerMonoidRunArgs          = []
     ,dockerMonoidMount            = []
-    ,dockerMonoidPassHost         = Nothing
     ,dockerMonoidDatabasePath     = Nothing
     }
   mappend l r = DockerOptsMonoid
@@ -131,7 +125,6 @@ instance Monoid DockerOptsMonoid where
     ,dockerMonoidContainerName    = dockerMonoidContainerName l <|> dockerMonoidContainerName r
     ,dockerMonoidRunArgs          = dockerMonoidRunArgs r <> dockerMonoidRunArgs l
     ,dockerMonoidMount            = dockerMonoidMount r <> dockerMonoidMount l
-    ,dockerMonoidPassHost         = dockerMonoidPassHost l <|> dockerMonoidPassHost r
     ,dockerMonoidDatabasePath     = dockerMonoidDatabasePath l <|> dockerMonoidDatabasePath r
     }
 
@@ -209,10 +202,6 @@ dockerContainerNameArgName = "container-name"
 -- | Docker persist argument name.
 dockerPersistArgName :: Text
 dockerPersistArgName = "persist"
-
--- | Docker pass host argument name.
-dockerPassHostArgName :: Text
-dockerPassHostArgName = "pass-host"
 
 -- | Docker database path argument name.
 dockerDatabasePathArgName :: Text

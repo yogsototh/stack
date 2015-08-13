@@ -4,8 +4,9 @@
 module Network.HTTP.Download
     ( verifiedDownload
     , DownloadRequest(..)
-    , drRetriesDefault
+    , drRetryPolicyDefault
     , HashCheck(..)
+    , DownloadException(..)
     , CheckHexDigest(..)
     , LengthCheck
     , VerifiedDownloadException(..)
@@ -70,7 +71,7 @@ download req destpath = do
             { drRequest = req
             , drHashChecks = []
             , drLengthCheck = Nothing
-            , drRetries = drRetriesDefault
+            , drRetryPolicy = drRetryPolicyDefault
             }
     let progressHook _ = return ()
     verifiedDownload downloadReq destpath progressHook

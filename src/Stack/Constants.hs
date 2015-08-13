@@ -11,6 +11,7 @@ module Stack.Constants
     ,distDirFromDir
     ,distRelativeDir
     ,haskellModuleExts
+    ,imageStagingDir
     ,projectDockerSandboxDir
     ,rawGithubUrl
     ,stackDotYaml
@@ -28,13 +29,19 @@ module Stack.Constants
     ,implicitGlobalDir
     ,hpcRelativeDir
     ,hpcDirFromDir
-    ,dotHpc)
+    ,dotHpc
+    ,objectInterfaceDir
+    ,templatesDir
+    ,defaultAuthorEmail
+    ,defaultAuthorName
+    ,globalConfigPath
+    ,authorEmailKey
+    ,authorNameKey
+    ,scmInitKey)
     where
-
 
 import           Control.Monad.Catch (MonadThrow)
 import           Control.Monad.Reader
-
 import           Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
 import           Data.Text (Text)
@@ -108,6 +115,10 @@ defaultShakeThreads = 4
 -- | User documentation directory.
 userDocsDir :: Config -> Path Abs Dir
 userDocsDir config = configStackRoot config </> $(mkRelDir "doc/")
+
+-- | Output .o/.hi directory.
+objectInterfaceDir :: BuildConfig -> Path Abs Dir
+objectInterfaceDir bconfig = bcWorkDir bconfig </> $(mkRelDir "odir/")
 
 -- | The filename used for dirtiness check of source files.
 buildCacheFile :: (MonadThrow m, MonadReader env m, HasPlatform env,HasEnvConfig env)
@@ -184,6 +195,10 @@ distDirFromDir :: (MonadThrow m, MonadReader env m, HasPlatform env, HasEnvConfi
 distDirFromDir fp =
     liftM (fp </>) distRelativeDir
 
+-- | Directory for project templates.
+templatesDir :: Config -> Path Abs Dir
+templatesDir config = configStackRoot config </> $(mkRelDir "templates")
+
 -- | Relative location of build artifacts.
 distRelativeDir :: (MonadThrow m, MonadReader env m, HasPlatform env, HasEnvConfig env)
                 => m (Path Rel Dir)
@@ -235,6 +250,10 @@ rawGithubUrl org repo branch file = T.concat
 projectDockerSandboxDir :: Path Abs Dir -> Path Abs Dir
 projectDockerSandboxDir projectRoot = projectRoot </> workDirRel </> $(mkRelDir "docker/")
 
+-- | Image staging dir from project root.
+imageStagingDir :: Path Abs Dir -> Path Abs Dir
+imageStagingDir p = p </> workDirRel </> $(mkRelDir "image/")
+
 -- | Name of the 'stack' program.
 stackProgName :: String
 stackProgName = "stack"
@@ -280,3 +299,15 @@ implicitGlobalDir p =
 -- | Where .mix files go.
 dotHpc :: Path Rel Dir
 dotHpc = $(mkRelDir ".hpc")
+
+-- | Default author email.
+defaultAuthorEmail :: Text
+defaultAuthorEmail = "example@example.com"
+
+-- | Default author name.
+defaultAuthorName :: Text
+defaultAuthorName = "Example Author Name"
+
+-- | Global config path.
+globalConfigPath :: Config -> Path Abs File
+globalConfigPath = (</> $(mkRelFile "stack.yaml")) . configStackRoot

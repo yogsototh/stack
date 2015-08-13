@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -8,15 +10,20 @@ module Stack.Exec where
 
 import           Control.Monad.Reader
 import           Control.Monad.Logger
-import           Control.Monad.Catch
-
-
-import           Path
+import           Control.Monad.Catch hiding (try)
+import           Control.Monad.Trans.Control (MonadBaseControl)
 import           Stack.Types
-import           System.Directory (doesFileExist)
+import           System.Process.Log
+
+#ifdef mingw32_HOST_OS
+import           Control.Exception.Lifted
+import           Data.Streaming.Process (ProcessExitedUnsuccessfully(..))
 import           System.Exit
-import qualified System.Process as P
-import           System.Process.Read
+import           System.Process.Run (callProcess)
+#else
+import           System.Process.Read (envHelper, preProcess)
+import           System.Posix.Process (executeFile)
+#endif
 
 -- | Default @EnvSettings@ which includes locals and GHC_PACKAGE_PATH
 defaultEnvSettings :: EnvSettings
@@ -35,21 +42,18 @@ plainEnvSettings = EnvSettings
     }
 
 -- | Execute a process within the Stack configured environment.
-exec :: (HasConfig r, MonadReader r m, MonadIO m, MonadLogger m, MonadThrow m)
-        => EnvSettings -> String -> [String] -> m b
-exec envSettings cmd args = do
+exec :: (HasConfig r, MonadReader r m, MonadIO m, MonadLogger m, MonadThrow m, MonadBaseControl IO m)
+     => EnvSettings -> String -> [String] -> m b
+exec envSettings cmd0 args = do
     config <- asks getConfig
     menv <- liftIO (configEnvOverride config envSettings)
-    exists <- liftIO $ doesFileExist cmd
-    cmd' <-
-        if exists
-            then return cmd
-            else liftM toFilePath $ join $ System.Process.Read.findExecutable menv cmd
-    let cp = (P.proc cmd' args)
-            { P.env = envHelper menv
-            , P.delegate_ctlc = True
-            }
-    $logProcessRun cmd' args
-    (Nothing, Nothing, Nothing, ph) <- liftIO (P.createProcess cp)
-    ec <- liftIO (P.waitForProcess ph)
-    liftIO (exitWith ec)
+    $logProcessRun cmd0 args
+#ifdef mingw32_HOST_OS
+    e <- try (callProcess Nothing menv cmd0 args)
+    liftIO $ case e of
+        Left (ProcessExitedUnsuccessfully _ ec) -> exitWith ec
+        Right () -> exitSuccess
+#else
+    cmd <- preProcess Nothing menv cmd0
+    liftIO $ executeFile cmd True args (envHelper menv)
+#endif

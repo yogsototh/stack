@@ -4,18 +4,20 @@
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE RecordWildCards       #-}
 {-# LANGUAGE TemplateHaskell       #-}
--- Perform a build
+-- | Perform a build
 module Stack.Build.Execute
     ( printPlan
     , preFetch
     , executePlan
-    -- TESTING
-    , compareTestsComponents
+    -- * Running Setup.hs
+    , ExecuteEnv
+    , withExecuteEnv
+    , withSingleContext
     ) where
 
-import           Control.Applicative            ((<$>), (<*>))
-import           Control.Concurrent.Lifted (fork)
+import           Control.Applicative            ((<$>))
 import           Control.Concurrent.Execute
+import           Control.Concurrent.Lifted      (fork)
 import           Control.Concurrent.MVar.Lifted
 import           Control.Concurrent.STM
 import           Control.Exception.Enclosed     (tryIO)
@@ -47,7 +49,6 @@ import qualified Data.Streaming.Process         as Process
 import           Data.Traversable               (forM)
 import           Data.Text                      (Text)
 import qualified Data.Text                      as T
-import qualified Data.Text.Encoding             as T
 import           Data.Text.Encoding             (encodeUtf8)
 import           Data.Word8                     (_colon)
 import           Distribution.System            (OS (Windows),
@@ -57,12 +58,12 @@ import           Network.HTTP.Client.Conduit    (HasHttpManager)
 import           Path
 import           Path.IO
 import           Prelude                        hiding (FilePath, writeFile)
-import           Safe                           (lastMay)
 import           Stack.Build.Cache
+import           Stack.Build.Coverage
 import           Stack.Build.Haddock
 import           Stack.Build.Installed
 import           Stack.Build.Source
-import           Stack.Build.Types
+import           Stack.Types.Build
 import           Stack.Fetch                    as Fetch
 import           Stack.GhcPkg
 import           Stack.Package
@@ -78,6 +79,7 @@ import           System.IO
 import           System.IO.Temp                 (withSystemTempDirectory)
 import           System.Process.Internals       (createProcess_)
 import           System.Process.Read
+import           System.Process.Run
 import           System.Process.Log             (showProcessArgDebug)
 
 type M env m = (MonadIO m,MonadReader env m,HasHttpManager env,HasBuildConfig env,MonadLogger m,MonadBaseControl IO m,MonadCatch m,MonadMask m,HasLogLevel env,HasEnvConfig env,HasTerminal env)
@@ -102,12 +104,11 @@ preFetch plan
                 (packageVersion package)
 
 printPlan :: M env m
-          => FinalAction
-          -> Plan
+          => Plan
           -> m ()
-printPlan finalAction plan = do
+printPlan plan = do
     case Map.toList $ planUnregisterLocal plan of
-        [] -> $logInfo "Nothing to unregister"
+        [] -> $logInfo "No packages would be unregistered."
         xs -> do
             $logInfo "Would unregister locally:"
             forM_ xs $ \(gid, reason) -> $logInfo $ T.concat
@@ -120,31 +121,29 @@ printPlan finalAction plan = do
     $logInfo ""
 
     case Map.elems $ planTasks plan of
-        [] -> $logInfo "Nothing to build"
+        [] -> $logInfo "Nothing to build."
         xs -> do
             $logInfo "Would build:"
             mapM_ ($logInfo . displayTask) xs
 
-    let mfinalLabel =
-            case finalAction of
-                DoNothing -> Nothing
-                DoBenchmarks _ -> Just "benchmark"
-                DoTests _ -> Just "test"
-    case mfinalLabel of
-        Nothing -> return ()
-        Just finalLabel -> do
-            $logInfo ""
+    let hasTests = not . Set.null . lptbTests
+        hasBenches = not . Set.null . lptbBenches
+        tests = Map.elems $ fmap fst $ Map.filter (hasTests . snd) $ planFinals plan
+        benches = Map.elems $ fmap fst $ Map.filter (hasBenches . snd) $ planFinals plan
 
-            case Map.toList $ planFinals plan of
-                [] -> $logInfo $ "Nothing to " <> finalLabel
-                xs -> do
-                    $logInfo $ "Would " <> finalLabel <> ":"
-                    forM_ xs $ \(name, _) -> $logInfo $ packageNameText name
+    unless (null tests) $ do
+        $logInfo ""
+        $logInfo "Would test:"
+        mapM_ ($logInfo . displayTask) tests
+    unless (null benches) $ do
+        $logInfo ""
+        $logInfo "Would benchmark:"
+        mapM_ ($logInfo . displayTask) benches
 
     $logInfo ""
 
     case Map.toList $ planInstallExes plan of
-        [] -> $logInfo "No executables to be installed"
+        [] -> $logInfo "No executables to be installed."
         xs -> do
             $logInfo "Would install executables:"
             forM_ xs $ \(name, loc) -> $logInfo $ T.concat
@@ -194,16 +193,15 @@ data ExecuteEnv = ExecuteEnv
     , eeGlobalDB       :: !(Path Abs Dir)
     }
 
--- | Perform the actual plan
-executePlan :: M env m
-            => EnvOverride
-            -> BuildOpts
-            -> BaseConfigOpts
-            -> [LocalPackage]
-            -> SourceMap
-            -> Plan
-            -> m ()
-executePlan menv bopts baseConfigOpts locals sourceMap plan = do
+withExecuteEnv :: M env m
+               => EnvOverride
+               -> BuildOpts
+               -> BaseConfigOpts
+               -> [LocalPackage]
+               -> SourceMap
+               -> (ExecuteEnv -> m a)
+               -> m a
+withExecuteEnv menv bopts baseConfigOpts locals sourceMap inner = do
     withSystemTempDirectory stackProgName $ \tmpdir -> do
         tmpdir' <- parseAbsDir tmpdir
         configLock <- newMVar ()
@@ -213,7 +211,7 @@ executePlan menv bopts baseConfigOpts locals sourceMap plan = do
         liftIO $ writeFile (toFilePath setupHs) "import Distribution.Simple\nmain = defaultMain"
         cabalPkgVer <- asks (envConfigCabalVersion . getEnvConfig)
         globalDB <- getGlobalDB menv
-        executePlan' plan ExecuteEnv
+        inner ExecuteEnv
             { eeEnvOverride = menv
             , eeBuildOpts = bopts
              -- Uncertain as to why we cannot run configures in parallel. This appears
@@ -233,6 +231,18 @@ executePlan menv bopts baseConfigOpts locals sourceMap plan = do
             , eeSourceMap = sourceMap
             , eeGlobalDB = globalDB
             }
+
+-- | Perform the actual plan
+executePlan :: M env m
+            => EnvOverride
+            -> BuildOpts
+            -> BaseConfigOpts
+            -> [LocalPackage]
+            -> SourceMap
+            -> Plan
+            -> m ()
+executePlan menv bopts baseConfigOpts locals sourceMap plan = do
+    withExecuteEnv menv bopts baseConfigOpts locals sourceMap (executePlan' plan)
 
     unless (Map.null $ planInstallExes plan) $ do
         snapBin <- (</> bindirSuffix) `liftM` installationRootDeps
@@ -295,6 +305,10 @@ executePlan menv bopts baseConfigOpts locals sourceMap plan = do
                 , ":"]
             forM_ executables $ \exe -> $logInfo $ T.append "- " exe
 
+    forM_ (boptsExec bopts) $ \(cmd, args) -> do
+        $logProcessRun cmd args
+        callProcess Nothing menv cmd args
+
 -- | Windows can't write over the current executable. Instead, we rename the
 -- current executable to something else and then do the copy.
 windowsRenameCopy :: FilePath -> FilePath -> IO ()
@@ -342,14 +356,14 @@ executePlan' plan ee@ExecuteEnv {..} = do
     let keepGoing =
             case boptsKeepGoing eeBuildOpts of
                 Just kg -> kg
-                Nothing ->
-                    case boptsFinalAction eeBuildOpts of
-                        DoNothing -> False
-                        _ -> True
+                Nothing -> boptsTests eeBuildOpts || boptsBenchmarks eeBuildOpts
         concurrentFinal =
-            case boptsFinalAction eeBuildOpts of
-                DoTests _ -> concurrentTests
-                _ -> True
+            -- TODO it probably makes more sense to use a lock for test suites
+            -- and just have the execution blocked. Turning off all concurrency
+            -- on finals based on the --test option doesn't fit in well.
+            if boptsTests eeBuildOpts
+                then concurrentTests
+                else True
     terminal <- asks getTerminal
     errs <- liftIO $ runActions threads keepGoing concurrentFinal actions $ \doneVar -> do
         let total = length actions
@@ -368,13 +382,16 @@ executePlan' plan ee@ExecuteEnv {..} = do
             then loop 0
             else return ()
     unless (null errs) $ throwM $ ExecutionFailure errs
-    when (boptsHaddock eeBuildOpts && not (null actions))
-        (generateHaddockIndex eeEnvOverride eeBaseConfigOpts eeLocals)
+    when (boptsHaddock eeBuildOpts) $ do
+        generateLocalHaddockIndex eeEnvOverride eeBaseConfigOpts eeLocals
+        generateDepsHaddockIndex eeEnvOverride eeBaseConfigOpts eeLocals
+        generateSnapHaddockIndex eeEnvOverride eeBaseConfigOpts eeGlobalDB
+    when (toCoverage $ boptsTestOpts eeBuildOpts) generateHpcMarkupIndex
 
 toActions :: M env m
           => (m () -> IO ())
           -> ExecuteEnv
-          -> (Maybe Task, Maybe Task) -- build and final
+          -> (Maybe Task, Maybe (Task, LocalPackageTB)) -- build and final
           -> [Action]
 toActions runInBase ee (mbuild, mfinal) =
     abuild ++ afinal
@@ -391,37 +408,29 @@ toActions runInBase ee (mbuild, mfinal) =
                     }
                 ]
     afinal =
-        case (,) <$> mfinal <*> mfunc of
-            Just (task@Task {..}, (func, checkTask)) | checkTask task ->
+        case mfinal of
+            Nothing -> []
+            Just (task@Task {..}, lptb) ->
                 [ Action
                     { actionId = ActionId taskProvides ATFinal
                     , actionDeps = addBuild taskProvides $
                         (Set.map (\ident -> ActionId ident ATBuild) (tcoMissing taskConfigOpts))
-                    , actionDo = \ac -> runInBase $ func ac ee task
+                    , actionDo = \ac -> runInBase $ do
+                        unless (Set.null $ lptbTests lptb) $ do
+                            singleTest topts lptb ac ee task
+                        unless (Set.null $ lptbBenches lptb) $ do
+                            singleBench beopts lptb ac ee task
                     }
                 ]
-            _ -> []
       where
         addBuild ident =
             case mbuild of
                 Nothing -> id
                 Just _ -> Set.insert $ ActionId ident ATBuild
 
-    mfunc =
-        case boptsFinalAction $ eeBuildOpts ee of
-            DoNothing -> Nothing
-            DoTests topts -> Just (singleTest topts, checkTest)
-            DoBenchmarks beopts -> Just (singleBench beopts, checkBench)
-
-    checkTest task =
-        case taskType task of
-            TTLocal lp -> not $ Set.null $ packageTests $ lpPackage lp
-            _ -> assert False False
-
-    checkBench task =
-        case taskType task of
-            TTLocal lp -> not $ Set.null $ packageBenchmarks $ lpPackage lp
-            _ -> assert False False
+    bopts = eeBuildOpts ee
+    topts = boptsTestOpts bopts
+    beopts = boptsBenchmarkOpts bopts
 
 -- | Ensure that the configuration for the package matches what is given
 ensureConfig :: M env m
@@ -456,7 +465,7 @@ ensureConfig pkgDir ExecuteEnv {..} Task {..} announce cabal cabalfp extra = do
             , configCacheDeps = allDeps
             , configCacheComponents =
                 case taskType of
-                    TTLocal lp -> Set.map encodeUtf8 $ lpComponents lp
+                    TTLocal lp -> Set.map renderComponent $ lpComponents lp
                     TTUpstream _ _ -> Set.empty
             , configCacheHaddock =
                 shouldHaddockPackage eeBuildOpts eeWanted (packageIdentifierName taskProvides)
@@ -477,6 +486,7 @@ withSingleContext :: M env m
                   => ActionContext
                   -> ExecuteEnv
                   -> Task
+                  -> Maybe String
                   -> (  Package
                      -> Path Abs File
                      -> Path Abs Dir
@@ -486,7 +496,7 @@ withSingleContext :: M env m
                      -> Maybe (Path Abs File, Handle)
                      -> m a)
                   -> m a
-withSingleContext ActionContext {..} ExecuteEnv {..} task@Task {..} inner0 =
+withSingleContext ActionContext {..} ExecuteEnv {..} task@Task {..} msuffix inner0 =
     withPackage $ \package cabalfp pkgDir ->
     withLogFile package $ \mlogFile ->
     withCabal package pkgDir mlogFile $ \cabal ->
@@ -525,7 +535,7 @@ withSingleContext ActionContext {..} ExecuteEnv {..} task@Task {..} inner0 =
     withLogFile package inner
         | console = inner Nothing
         | otherwise = do
-            logPath <- buildLogPath package -- TODO give a difference suffix for test, bench, etc?
+            logPath <- buildLogPath package msuffix
             createTree (parent logPath)
             let fp = toFilePath logPath
             bracket
@@ -542,14 +552,13 @@ withSingleContext ActionContext {..} ExecuteEnv {..} task@Task {..} inner0 =
             }
         exeName <- liftIO $ join $ findExecutable menv "runhaskell"
         distRelativeDir' <- distRelativeDir
-        msetuphs <-
+        setuphs <-
             -- Avoid broken Setup.hs files causing problems for simple build
             -- types, see:
             -- https://github.com/commercialhaskell/stack/issues/370
             if packageSimpleType package
-                then return Nothing
+                then return eeSetupHs
                 else liftIO $ getSetupHs pkgDir
-        let setuphs = fromMaybe eeSetupHs msetuphs
         inner $ \stripTHLoading args -> do
             let fullArgs =
                       ("-package=" ++
@@ -583,7 +592,13 @@ withSingleContext ActionContext {..} ExecuteEnv {..} task@Task {..} inner0 =
                 cp = cp0
                     { cwd = Just $ toFilePath pkgDir
                     , Process.env = envHelper menv
-                    , std_in = CreatePipe
+                    -- Ideally we'd create a new pipe here and then close it
+                    -- below to avoid the child process from taking from our
+                    -- stdin. However, if we do this, the child process won't
+                    -- be able to get the codepage on Windows that we want.
+                    -- See:
+                    -- https://github.com/commercialhaskell/stack/issues/738
+                    -- , std_in = CreatePipe
                     , std_out =
                         case mlogFile of
                                 Nothing -> CreatePipe
@@ -596,13 +611,12 @@ withSingleContext ActionContext {..} ExecuteEnv {..} task@Task {..} inner0 =
             $logProcessRun (toFilePath exeName) fullArgs
 
             -- Use createProcess_ to avoid the log file being closed afterwards
-            (Just inH, moutH, merrH, ph) <- liftIO $ createProcess_ "singleBuild" cp
-            liftIO $ hClose inH
+            (Nothing, moutH, merrH, ph) <- liftIO $ createProcess_ "singleBuild" cp
 
             let makeAbsolute = stripTHLoading -- If users want control, we should add a config option for this
 
             maybePrintBuildOutput stripTHLoading makeAbsolute LevelInfo mlogFile moutH
-            maybePrintBuildOutput stripTHLoading makeAbsolute LevelWarn mlogFile merrH
+            maybePrintBuildOutput False makeAbsolute LevelWarn mlogFile merrH
             ec <- liftIO $ waitForProcess ph
             case ec of
                 ExitSuccess -> return ()
@@ -635,7 +649,7 @@ singleBuild :: M env m
             -> Task
             -> m ()
 singleBuild ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} =
-  withSingleContext ac ee task $ \package cabalfp pkgDir cabal announce console _mlogFile -> do
+  withSingleContext ac ee task Nothing $ \package cabalfp pkgDir cabal announce console _mlogFile -> do
     (cache, _neededConfig) <- ensureConfig pkgDir ee task (announce "configure") cabal cabalfp []
 
     markExeNotInstalled (taskLocation task) taskProvides
@@ -648,7 +662,11 @@ singleBuild ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} =
     extraOpts <- extraBuildOptions
     cabal (console && configHideTHLoading config) $
         (case taskType of
-            TTLocal lp -> "build" : map T.unpack (Set.toList $ lpComponents lp)
+            TTLocal lp -> "build"
+                        -- Cabal... There doesn't seem to be a way to call out the library component...
+                        -- : "lib"
+                        : map (T.unpack . T.append "exe:")
+                              (maybe [] Set.toList $ lpExeComponents lp)
             TTUpstream _ _ -> ["build"]) ++ extraOpts
 
     let doHaddock = shouldHaddockPackage eeBuildOpts eeWanted (packageName package) &&
@@ -657,7 +675,10 @@ singleBuild ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} =
                     packageHasExposedModules package
     when doHaddock $ do
         announce "haddock"
-        hscolourExists <- doesExecutableExist eeEnvOverride "hscolour"
+        hscolourExists <- doesExecutableExist eeEnvOverride "HsColour"
+        unless hscolourExists $ $logWarn
+            ("Warning: haddock not generating hyperlinked sources because 'HsColour' not\n" <>
+             "found on PATH (use 'stack build hscolour --copy-bins' to install).")
         cabal False (concat [["haddock", "--html", "--hoogle", "--html-location=../$pkg-$version/"]
                             ,["--hyperlink-source" | hscolourExists]])
 
@@ -685,21 +706,23 @@ singleBuild ac@ActionContext {..} ee@ExecuteEnv {..} task@Task {..} =
     liftIO $ atomically $ modifyTVar eeGhcPkgIds $ Map.insert taskProvides mpkgid'
 
     when (doHaddock && shouldHaddockDeps eeBuildOpts) $
-        copyDepHaddocks
-            eeEnvOverride
-            eeBaseConfigOpts
-            (pkgDbs ++ [eeGlobalDB])
-            (PackageIdentifier (packageName package) (packageVersion package))
-            Set.empty
+        withMVar eeInstallLock $ \() ->
+            copyDepHaddocks
+                eeEnvOverride
+                eeBaseConfigOpts
+                (pkgDbs ++ [eeGlobalDB])
+                (PackageIdentifier (packageName package) (packageVersion package))
+                Set.empty
 
 singleTest :: M env m
            => TestOpts
+           -> LocalPackageTB
            -> ActionContext
            -> ExecuteEnv
            -> Task
            -> m ()
-singleTest topts ac ee task =
-    withSingleContext ac ee task $ \package cabalfp pkgDir cabal announce console mlogFile -> do
+singleTest topts lptb ac ee task =
+    withSingleContext ac ee task (Just "test") $ \package cabalfp pkgDir cabal announce console mlogFile -> do
         (_cache, neededConfig) <- ensureConfig pkgDir ee task (announce "configure (test)") cabal cabalfp ["--enable-tests"]
         config <- asks getConfig
 
@@ -713,11 +736,7 @@ singleTest topts ac ee task =
 
             needHpc = toCoverage topts
 
-            componentsRaw =
-                case taskType task of
-                    TTLocal lp -> Set.toList $ lpComponents lp
-                    TTUpstream _ _ -> assert False []
-            testsToRun = compareTestsComponents componentsRaw $ Set.toList $ packageTests package
+            testsToRun = Set.toList $ lptbTests lptb
             components = map (T.unpack . T.append "test:") testsToRun
 
         when needBuild $ do
@@ -729,7 +748,7 @@ singleTest topts ac ee task =
                 TTUpstream _ _ -> assert False $ return ()
             extraOpts <- extraBuildOptions
             cabal (console && configHideTHLoading config) $
-                "build" : (extraOpts ++ components)
+                "build" : (components ++ extraOpts)
             setTestBuilt pkgDir
 
         toRun <-
@@ -816,17 +835,10 @@ singleTest topts ac ee task =
                             ]
                         return $ Map.singleton testName Nothing
 
-            when needHpc $ forM_ (lastMay testsToRun) $ \testName -> do
+            when needHpc $ forM_ testsToRun $ \testName -> do
                 let pkgName = packageNameText (packageName package)
-                when (not $ null $ tail testsToRun) $ $logWarn $ T.concat
-                    [ "Error: The --coverage flag does not yet support multiple test suites in a single cabal file. "
-                    , "All of the tests have been run, however, the HPC report will only supply coverage info for "
-                    , pkgName
-                    , "'s last test, "
-                    , testName
-                    , "."
-                    ]
-                generateHpcReport pkgDir pkgName testName
+                    pkgId = packageIdentifierText (packageIdentifier package)
+                generateHpcReport pkgDir pkgName pkgId testName
 
             bs <- liftIO $
                 case mlogFile of
@@ -843,63 +855,15 @@ singleTest topts ac ee task =
 
             setTestSuccess pkgDir
 
--- | Determine the tests to be run based on the list of components.
-compareTestsComponents :: [Text] -- ^ components
-                       -> [Text] -- ^ all test names
-                       -> [Text] -- ^ tests to be run
-compareTestsComponents [] tests = tests -- no components -- all tests
-compareTestsComponents comps tests2 =
-    Set.toList $ Set.intersection tests1 $ Set.fromList tests2
-  where
-    tests1 = Set.unions $ map toSet comps
-
-    toSet x =
-        case T.break (== ':') x of
-            (y, "") -> assert (x == y) (Set.singleton x)
-            ("test", y) -> Set.singleton $ T.drop 1 y
-            _ -> Set.empty
-
--- | Generate the HTML report and show a textual coverage summary.
-generateHpcReport :: M env m => Path Abs Dir -> Text -> Text -> m ()
-generateHpcReport pkgDir pkgName testName = do
-    let whichTest = pkgName <> "'s test-suite \"" <> testName <> "\""
-    hpcDir <- hpcDirFromDir pkgDir
-    hpcRelDir <- (</> dotHpc) <$> hpcRelativeDir
-    pkgDirs <- Map.keys . bcPackages <$> asks getBuildConfig
-    let args =
-            concatMap (\x -> ["--srcdir", toFilePath x]) pkgDirs ++
-            ["--hpcdir", toFilePath hpcRelDir, "--reset-hpcdirs"]
-    tixFile <- parseRelFile (T.unpack testName ++ ".tix")
-    let tixFileAbs = hpcDir </> tixFile
-    tixFileExists <- fileExists tixFileAbs
-    if not tixFileExists
-        then $logError $ T.concat
-            [ "Didn't find .tix coverage file for "
-            , whichTest
-            , " - expected to find it at "
-            , T.pack (toFilePath tixFileAbs)
-            , "."
-            ]
-        else (`onException` $logError ("Error occurred while producing coverage report for " <> whichTest)) $ do
-            menv <- getMinimalEnvOverride
-            $logInfo $ "Generating HTML coverage report for " <> whichTest
-            _ <- readProcessStdout (Just hpcDir) menv "hpc"
-                ("markup" : toFilePath tixFileAbs : args)
-            output <- readProcessStdout (Just hpcDir) menv "hpc"
-                ("report" : toFilePath tixFileAbs : args)
-            forM_ (S8.lines output) ($logInfo . T.decodeUtf8 . stripCharacterReturn)
-            $logInfo
-                ("The HTML coverage report for " <> whichTest <> " is available at " <>
-                 T.pack (toFilePath (hpcDir </> $(mkRelFile "hpc_index.html"))))
-
 singleBench :: M env m
             => BenchmarkOpts
+            -> LocalPackageTB
             -> ActionContext
             -> ExecuteEnv
             -> Task
             -> m ()
-singleBench beopts ac ee task =
-    withSingleContext ac ee task $ \_package cabalfp pkgDir cabal announce console _mlogFile -> do
+singleBench beopts _lptb ac ee task =
+    withSingleContext ac ee task (Just "bench") $ \_package cabalfp pkgDir cabal announce console _mlogFile -> do
         (_cache, neededConfig) <- ensureConfig pkgDir ee task (announce "configure (benchmarks)") cabal cabalfp ["--enable-benchmarks"]
 
         benchBuilt <- checkBenchBuilt pkgDir
@@ -935,7 +899,7 @@ printBuildOutput :: (MonadIO m, MonadBaseControl IO m, MonadLogger m)
 printBuildOutput excludeTHLoading makeAbsolute level outH = void $ fork $
          CB.sourceHandle outH
     $$ CB.lines
-    =$ CL.map stripCharacterReturn
+    =$ CL.map stripCarriageReturn
     =$ CL.filter (not . isTHLoading)
     =$ CL.mapM toAbsolutePath
     =$ CL.mapM_ (monadLoggerLog $(TH.location >>= liftLoc) "" level)
@@ -976,29 +940,23 @@ printBuildOutput excludeTHLoading makeAbsolute level outH = void $ fork $
 
         guard $ bs2 == ":"
 
--- | Strip a @\r@ character from the byte vector. Used because Windows.
-stripCharacterReturn :: ByteString -> ByteString
-stripCharacterReturn = S8.filter (not . (=='\r'))
+    -- | Strip @\r@ characters from the byte vector. Used because Windows.
+    stripCarriageReturn :: ByteString -> ByteString
+    stripCarriageReturn = S8.filter (not . (=='\r'))
 
-taskLocation :: Task -> InstallLocation
-taskLocation task =
-    case taskType task of
-        TTLocal _ -> Local
-        TTUpstream _ loc -> loc
-
--- | Ensure Setup.hs exists in the given directory. Returns an action
--- to remove it later.
+-- | Find the Setup.hs or Setup.lhs in the given directory. If none exists,
+-- throw an exception.
 getSetupHs :: Path Abs Dir -- ^ project directory
-           -> IO (Maybe (Path Abs File))
+           -> IO (Path Abs File)
 getSetupHs dir = do
     exists1 <- fileExists fp1
     if exists1
-        then return $ Just fp1
+        then return fp1
         else do
             exists2 <- fileExists fp2
             if exists2
-                then return $ Just fp2
-                else return Nothing
+                then return fp2
+                else throwM $ NoSetupHsFound dir
   where
     fp1 = dir </> $(mkRelFile "Setup.hs")
     fp2 = dir </> $(mkRelFile "Setup.lhs")
@@ -1006,4 +964,4 @@ getSetupHs dir = do
 extraBuildOptions :: M env m => m [String]
 extraBuildOptions = do
     hpcIndexDir <- toFilePath . (</> dotHpc) <$> hpcRelativeDir
-    return ["--ghc-options", "-hpcdir " ++ hpcIndexDir]
+    return ["--ghc-options", "-hpcdir " ++ hpcIndexDir ++ " -ddump-hi -ddump-to-file"]

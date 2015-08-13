@@ -1,4 +1,22 @@
-## Unreleased
+## 0.1.3.1
+
+Bug fixes:
+
+* Ignore disabled executables [#763](https://github.com/commercialhaskell/stack/issues/763)
+
+## 0.1.3.0
+
+Major changes:
+
+* Detect when a module is compiled but not listed in the cabal file ([#32](https://github.com/commercialhaskell/stack/issues/32))
+    * A warning is displayed for any modules that should be added to `other-modules` in the .cabal file
+    * These modules are taken into account when determining whether a package needs to be built
+* Respect TemplateHaskell addDependentFile dependency changes ([#105](https://github.com/commercialhaskell/stack/issues/105))
+    * TH dependent files are taken into account when determining whether a package needs to be built.
+* Overhauled target parsing, added `--test` and `--bench` options [#651](https://github.com/commercialhaskell/stack/issues/651)
+    * For details, see [Build commands Wiki page](https://github.com/commercialhaskell/stack/wiki/Build-command)
+
+Other enhancements:
 
 * Set the `HASKELL_DIST_DIR` environment variable [#524](https://github.com/commercialhaskell/stack/pull/524)
 * Track build status of tests and benchmarks [#525](https://github.com/commercialhaskell/stack/issues/525)
@@ -11,11 +29,29 @@
 * --force-dirty flag: Force treating all local packages as having dirty files (useful for cases where stack can't detect a file change)
 * GHC error messages: display file paths as absolute instead of relative for better editor integration
 * Add the `--copy-bins` option [#569](https://github.com/commercialhaskell/stack/issues/569)
+* Give warnings on unexpected config keys [#48](https://github.com/commercialhaskell/stack/issues/48)
+* Remove Docker `pass-host` option
+* Don't require cabal-install to upload [#313](https://github.com/commercialhaskell/stack/issues/313)
+* Generate indexes for all deps and all installed snapshot packages [#143](https://github.com/commercialhaskell/stack/issues/143)
+* Provide `--resolver global` option [#645](https://github.com/commercialhaskell/stack/issues/645)
+    * Also supports `--resolver nightly`, `--resolver lts`, and `--resolver lts-X`
+* Make `stack build --flag` error when flag or package is unknown [#617](https://github.com/commercialhaskell/stack/issues/617)
+* Preserve file permissions when unpacking sources [#666](https://github.com/commercialhaskell/stack/pull/666)
+* `stack build` etc work outside of a project
+* `list-dependencies` command [#638](https://github.com/commercialhaskell/stack/issues/638)
+* `--upgrade-cabal` option to `stack setup` [#174](https://github.com/commercialhaskell/stack/issues/174)
+* `--exec` option [#651](https://github.com/commercialhaskell/stack/issues/651)
+* `--only-dependencies` implemented correctly [#387](https://github.com/commercialhaskell/stack/issues/387)
 
 Bug fixes:
 
 * Extensions from the `other-extensions` field no longer enabled by default [#449](https://github.com/commercialhaskell/stack/issues/449)
 * Fix: haddock forces rebuild of empty packages [#452](https://github.com/commercialhaskell/stack/issues/452)
+* Don't copy over executables excluded by component selection [#605](https://github.com/commercialhaskell/stack/issues/605)
+* Fix: stack fails on Windows with git package in stack.yaml and no git binary on path [#712](https://github.com/commercialhaskell/stack/issues/712)
+* Fixed GHCi issue: Specifying explicit package versions (#678)
+* Fixed GHCi issue: Specifying -odir and -hidir as .stack-work/odir (#529)
+* Fixed GHCi issue: Specifying A instead of A.ext for modules (#498) 
 
 ## 0.1.2.0
 

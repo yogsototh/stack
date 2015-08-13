@@ -1,8 +1,10 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE RecordWildCards #-}
 
 -- | The Config type.
@@ -13,10 +15,13 @@ import           Control.Applicative ((<|>), (<$>), (<*>), pure)
 import           Control.Exception
 import           Control.Monad (liftM, mzero)
 import           Control.Monad.Catch (MonadThrow, throwM)
-import           Control.Monad.Reader (MonadReader, ask, asks, MonadIO, liftIO)
 import           Control.Monad.Logger (LogLevel(..))
-import           Data.Aeson.Extended (ToJSON, toJSON, FromJSON, parseJSON, withText, withObject, object
-                            ,(.=), (.:?), (.!=), (.:), Value (String, Object))
+import           Control.Monad.Reader (MonadReader, ask, asks, MonadIO, liftIO)
+import           Data.Aeson.Extended
+                 (ToJSON, toJSON, FromJSON, parseJSON, withText, withObject, object,
+                  (.=), (.:), (..:), (..:?), (..!=), Value(String, Object),
+                  withObjectWarnings, WarningParser, Object, jsonSubWarnings, JSONWarning,
+                  jsonSubWarningsMT)
 import           Data.Binary (Binary)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as S8
@@ -24,9 +29,9 @@ import           Data.Either (partitionEithers)
 import           Data.Hashable (Hashable)
 import           Data.Map (Map)
 import qualified Data.Map as Map
+import           Data.Monoid
 import           Data.Set (Set)
 import qualified Data.Set as Set
-import           Data.Monoid
 import           Data.Text (Text)
 import qualified Data.Text as T
 import           Data.Text.Encoding (encodeUtf8, decodeUtf8)
@@ -34,10 +39,10 @@ import           Data.Typeable
 import           Data.Yaml (ParseException)
 import           Distribution.System (Platform)
 import qualified Distribution.Text
-import           Distribution.Version (anyVersion, intersectVersionRanges)
-import qualified Paths_stack as Meta
+import           Distribution.Version (anyVersion)
 import           Network.HTTP.Client (parseUrl)
 import           Path
+import qualified Paths_stack as Meta
 import           Stack.Types.BuildPlan (SnapName, renderSnapName, parseSnapName)
 import           Stack.Types.Docker
 import           Stack.Types.FlagName
@@ -106,6 +111,12 @@ data Config =
          ,configConcurrentTests     :: !Bool
          -- ^ Run test suites concurrently
          ,configImage               :: !ImageOpts
+         ,configAuthorEmail         :: !(Maybe Text)
+         -- ^ Email of the author using stack.
+         ,configAuthorName          :: !(Maybe Text)
+         -- ^ Name of the author using stack.
+         ,configScmInit             :: !(Maybe SCM)
+         -- ^ Initialize SCM (e.g. git) when creating new projects.
          }
 
 -- | Information on a single package index
@@ -121,12 +132,12 @@ data PackageIndex = PackageIndex
     -- ^ Require that hashes and package size information be available for packages in this index
     }
     deriving Show
-instance FromJSON PackageIndex where
-    parseJSON = withObject "PackageIndex" $ \o -> do
-        name <- o .: "name"
-        prefix <- o .: "download-prefix"
-        mgit <- o .:? "git"
-        mhttp <- o .:? "http"
+instance FromJSON (PackageIndex, [JSONWarning]) where
+    parseJSON = withObjectWarnings "PackageIndex" $ \o -> do
+        name <- o ..: "name"
+        prefix <- o ..: "download-prefix"
+        mgit <- o ..:? "git"
+        mhttp <- o ..:? "http"
         loc <-
             case (mgit, mhttp) of
                 (Nothing, Nothing) -> fail $
@@ -135,8 +146,8 @@ instance FromJSON PackageIndex where
                 (Just git, Nothing) -> return $ ILGit git
                 (Nothing, Just http) -> return $ ILHttp http
                 (Just git, Just http) -> return $ ILGitHttp git http
-        gpgVerify <- o .:? "gpg-verify" .!= False
-        reqHashes <- o .:? "require-hashes" .!= False
+        gpgVerify <- o ..:? "gpg-verify" ..!= False
+        reqHashes <- o ..:? "require-hashes" ..!= False
         return PackageIndex
             { indexName = name
             , indexLocation = loc
@@ -188,12 +199,23 @@ data ExecOptsExtra
         }
 -- | Parsed global command-line options.
 data GlobalOpts = GlobalOpts
-    { globalLogLevel     :: LogLevel -- ^ Log level
-    , globalConfigMonoid :: ConfigMonoid -- ^ Config monoid, for passing into 'loadConfig'
-    , globalResolver     :: Maybe Resolver -- ^ Resolver override
-    , globalTerminal     :: Bool -- ^ We're in a terminal?
-    , globalStackYaml    :: Maybe FilePath -- ^ Override project stack.yaml
+    { globalReExec       :: !Bool
+    , globalLogLevel     :: !LogLevel -- ^ Log level
+    , globalConfigMonoid :: !ConfigMonoid -- ^ Config monoid, for passing into 'loadConfig'
+    , globalResolver     :: !(Maybe AbstractResolver) -- ^ Resolver override
+    , globalTerminal     :: !Bool -- ^ We're in a terminal?
+    , globalStackYaml    :: !(Maybe FilePath) -- ^ Override project stack.yaml
     } deriving (Show)
+
+-- | Either an actual resolver value, or an abstract description of one (e.g.,
+-- latest nightly).
+data AbstractResolver
+    = ARLatestNightly
+    | ARLatestLTS
+    | ARLatestLTSMajor !Int
+    | ARResolver !Resolver
+    | ARGlobal
+    deriving Show
 
 -- | Default logging level should be something useful but not crazy.
 defaultLogLevel :: LogLevel
@@ -209,7 +231,7 @@ data BuildConfig = BuildConfig
       -- packages.
     , bcGhcVersionExpected :: !Version
       -- ^ Version of GHC we expected for this build
-    , bcPackages   :: !(Map (Path Abs Dir) Bool)
+    , bcPackageEntries :: ![PackageEntry]
       -- ^ Local packages identified by a path, Bool indicates whether it is
       -- a non-dependency (the opposite of 'peExtraDep')
     , bcExtraDeps  :: !(Map PackageName Version)
@@ -217,8 +239,6 @@ data BuildConfig = BuildConfig
       --
       -- These dependencies will not be installed to a shared location, and
       -- will override packages provided by the resolver.
-    , bcRoot       :: !(Path Abs Dir)
-      -- ^ Directory containing the project's stack.yaml file
     , bcStackYaml  :: !(Path Abs File)
       -- ^ Location of the stack.yaml file.
       --
@@ -226,13 +246,25 @@ data BuildConfig = BuildConfig
       -- different from bcRoot </> "stack.yaml"
     , bcFlags      :: !(Map PackageName (Map FlagName Bool))
       -- ^ Per-package flag overrides
+    , bcImplicitGlobal :: !Bool
+      -- ^ Are we loading from the implicit global stack.yaml? This is useful
+      -- for providing better error messages.
     }
+
+-- | Directory containing the project's stack.yaml file
+bcRoot :: BuildConfig -> Path Abs Dir
+bcRoot = parent . bcStackYaml
+
+-- | Directory containing the project's stack.yaml file
+bcWorkDir :: BuildConfig -> Path Abs Dir
+bcWorkDir = (</> workDirRel) . parent . bcStackYaml
 
 -- | Configuration after the environment has been setup.
 data EnvConfig = EnvConfig
     {envConfigBuildConfig :: !BuildConfig
     ,envConfigCabalVersion :: !Version
-    ,envConfigGhcVersion :: !Version}
+    ,envConfigGhcVersion :: !Version
+    ,envConfigPackages   :: !(Map (Path Abs Dir) Bool)}
 instance HasBuildConfig EnvConfig where
     getBuildConfig = envConfigBuildConfig
 instance HasConfig EnvConfig
@@ -247,16 +279,11 @@ instance HasEnvConfig EnvConfig where
 data LoadConfig m = LoadConfig
     { lcConfig          :: !Config
       -- ^ Top-level Stack configuration.
-    , lcLoadBuildConfig :: !(Maybe Resolver -> NoBuildConfigStrategy -> m BuildConfig)
+    , lcLoadBuildConfig :: !(Maybe AbstractResolver -> m BuildConfig)
         -- ^ Action to load the remaining 'BuildConfig'.
     , lcProjectRoot     :: !(Maybe (Path Abs Dir))
         -- ^ The project root directory, if in a project.
     }
-
-data NoBuildConfigStrategy
-    = ThrowException
-    | ExecStrategy
-    deriving (Show, Eq, Ord)
 
 data PackageEntry = PackageEntry
     { peExtraDepMaybe :: !(Maybe Bool)
@@ -293,20 +320,20 @@ instance ToJSON PackageEntry where
         , "location" .= peLocation pe
         , "subdirs" .= peSubdirs pe
         ]
-instance FromJSON PackageEntry where
+instance FromJSON (PackageEntry, [JSONWarning]) where
     parseJSON (String t) = do
         loc <- parseJSON $ String t
-        return PackageEntry
-            { peExtraDepMaybe = Nothing
-            , peValidWanted = Nothing
-            , peLocation = loc
-            , peSubdirs = []
-            }
-    parseJSON v = withObject "PackageEntry" (\o -> PackageEntry
-        <$> o .:? "extra-dep"
-        <*> o .:? "valid-wanted"
-        <*> o .: "location"
-        <*> o .:? "subdirs" .!= []) v
+        return (PackageEntry
+                { peExtraDepMaybe = Nothing
+                , peValidWanted = Nothing
+                , peLocation = loc
+                , peSubdirs = []
+                }, [])
+    parseJSON v = withObjectWarnings "PackageEntry" (\o -> PackageEntry
+        <$> o ..:? "extra-dep"
+        <*> o ..:? "valid-wanted"
+        <*> o ..: "location"
+        <*> o ..:? "subdirs" ..!= []) v
 
 data PackageLocation
     = PLFilePath FilePath
@@ -482,6 +509,12 @@ data ConfigMonoid =
     -- ^ Used to override the binary installation dir
     ,configMonoidImageOpts           :: !ImageOptsMonoid
     -- ^ Image creation options.
+    ,configMonoidAuthorEmail         :: !(Maybe Text)
+    -- ^ Author's email address.
+    ,configMonoidAuthorName          :: !(Maybe Text)
+    -- ^ Author's name.
+    ,configMonoidScmInit             :: !(Maybe SCM)
+    -- ^ Initialize SCM (e.g. git init) when making new projects?
     }
   deriving Show
 
@@ -505,6 +538,9 @@ instance Monoid ConfigMonoid where
     , configMonoidConcurrentTests = Nothing
     , configMonoidLocalBinPath = Nothing
     , configMonoidImageOpts = mempty
+    , configMonoidAuthorEmail = mempty
+    , configMonoidAuthorName = mempty
+    , configMonoidScmInit = Nothing
     }
   mappend l r = ConfigMonoid
     { configMonoidDockerOpts = configMonoidDockerOpts l <> configMonoidDockerOpts r
@@ -526,33 +562,43 @@ instance Monoid ConfigMonoid where
     , configMonoidConcurrentTests = configMonoidConcurrentTests l <|> configMonoidConcurrentTests r
     , configMonoidLocalBinPath = configMonoidLocalBinPath l <|> configMonoidLocalBinPath r
     , configMonoidImageOpts = configMonoidImageOpts l <> configMonoidImageOpts r
+    , configMonoidAuthorName = configMonoidAuthorName l <|> configMonoidAuthorName r
+    , configMonoidAuthorEmail = configMonoidAuthorEmail l <|> configMonoidAuthorEmail r
+    , configMonoidScmInit = configMonoidScmInit l <|> configMonoidScmInit r
     }
 
-instance FromJSON ConfigMonoid where
-  parseJSON =
-    withObject "ConfigMonoid" $
-    \obj ->
-      do configMonoidDockerOpts <- obj .:? T.pack "docker" .!= mempty
-         configMonoidConnectionCount <- obj .:? "connection-count"
-         configMonoidHideTHLoading <- obj .:? "hide-th-loading"
-         configMonoidLatestSnapshotUrl <- obj .:? "latest-snapshot-url"
-         configMonoidPackageIndices <- obj .:? "package-indices"
-         configMonoidSystemGHC <- obj .:? "system-ghc"
-         configMonoidInstallGHC <- obj .:? "install-ghc"
-         configMonoidSkipGHCCheck <- obj .:? "skip-ghc-check"
-         configMonoidSkipMsys <- obj .:? "skip-msys"
-         configMonoidRequireStackVersion <- unVersionRangeJSON <$>
-                                            obj .:? "require-stack-version"
-                                                .!= VersionRangeJSON anyVersion
-         configMonoidOS <- obj .:? "os"
-         configMonoidArch <- obj .:? "arch"
-         configMonoidJobs <- obj .:? "jobs"
-         configMonoidExtraIncludeDirs <- obj .:? "extra-include-dirs" .!= Set.empty
-         configMonoidExtraLibDirs <- obj .:? "extra-lib-dirs" .!= Set.empty
-         configMonoidConcurrentTests <- obj .:? "concurrent-tests"
-         configMonoidLocalBinPath <- obj .:? "local-bin-path"
-         configMonoidImageOpts <- obj .:? T.pack "image" .!= mempty
-         return ConfigMonoid {..}
+instance FromJSON (ConfigMonoid, [JSONWarning]) where
+  parseJSON = withObjectWarnings "ConfigMonoid" parseConfigMonoidJSON
+
+-- | Parse a partial configuration.  Used both to parse both a standalone config
+-- file and a project file, so that a sub-parser is not required, which would interfere with
+-- warnings for missing fields.
+parseConfigMonoidJSON :: Object -> WarningParser ConfigMonoid
+parseConfigMonoidJSON obj = do
+    configMonoidDockerOpts <- jsonSubWarnings (obj ..:? "docker" ..!= mempty)
+    configMonoidConnectionCount <- obj ..:? "connection-count"
+    configMonoidHideTHLoading <- obj ..:? "hide-th-loading"
+    configMonoidLatestSnapshotUrl <- obj ..:? "latest-snapshot-url"
+    configMonoidPackageIndices <- jsonSubWarningsMT (obj ..:? "package-indices")
+    configMonoidSystemGHC <- obj ..:? "system-ghc"
+    configMonoidInstallGHC <- obj ..:? "install-ghc"
+    configMonoidSkipGHCCheck <- obj ..:? "skip-ghc-check"
+    configMonoidSkipMsys <- obj ..:? "skip-msys"
+    configMonoidRequireStackVersion <- unVersionRangeJSON <$>
+                                       obj ..:? "require-stack-version"
+                                           ..!= VersionRangeJSON anyVersion
+    configMonoidOS <- obj ..:? "os"
+    configMonoidArch <- obj ..:? "arch"
+    configMonoidJobs <- obj ..:? "jobs"
+    configMonoidExtraIncludeDirs <- obj ..:? "extra-include-dirs" ..!= Set.empty
+    configMonoidExtraLibDirs <- obj ..:? "extra-lib-dirs" ..!= Set.empty
+    configMonoidConcurrentTests <- obj ..:? "concurrent-tests"
+    configMonoidLocalBinPath <- obj ..:? "local-bin-path"
+    configMonoidImageOpts <- jsonSubWarnings (obj ..:? "image" ..!= mempty)
+    configMonoidAuthorName <- obj ..:? authorNameKey
+    configMonoidAuthorEmail <- obj ..:? authorEmailKey
+    configMonoidScmInit <- obj ..:? scmInitKey
+    return ConfigMonoid {..}
 
 -- | Newtype for non-orphan FromJSON instance.
 newtype VersionRangeJSON = VersionRangeJSON { unVersionRangeJSON :: VersionRange }
@@ -749,8 +795,12 @@ bindirSuffix :: Path Rel Dir
 bindirSuffix = $(mkRelDir "bin")
 
 -- | Suffix applied to an installation root to get the doc dir
-docdirSuffix :: Path Rel Dir
-docdirSuffix = $(mkRelDir "doc")
+docDirSuffix :: Path Rel Dir
+docDirSuffix = $(mkRelDir "doc")
+
+-- | Suffix applied to an installation root to get the hpc dir
+hpcDirSuffix :: Path Rel Dir
+hpcDirSuffix = $(mkRelDir "hpc")
 
 -- | Get the extra bin directories (for the PATH). Puts more local first
 --
@@ -778,18 +828,18 @@ getMinimalEnvOverride = do
 data ProjectAndConfigMonoid
   = ProjectAndConfigMonoid !Project !ConfigMonoid
 
-instance FromJSON ProjectAndConfigMonoid where
-    parseJSON = withObject "Project, ConfigMonoid" $ \o -> do
-        dirs <- o .:? "packages" .!= [packageEntryCurrDir]
-        extraDeps' <- o .:? "extra-deps" .!= []
+instance (warnings ~ [JSONWarning]) => FromJSON (ProjectAndConfigMonoid, warnings) where
+    parseJSON = withObjectWarnings "ProjectAndConfigMonoid" $ \o -> do
+        dirs <- jsonSubWarningsMT (o ..:? "packages") ..!= [packageEntryCurrDir]
+        extraDeps' <- o ..:? "extra-deps" ..!= []
         extraDeps <-
             case partitionEithers $ goDeps extraDeps' of
                 ([], x) -> return $ Map.fromList x
                 (errs, _) -> fail $ unlines errs
 
-        flags <- o .:? "flags" .!= mempty
-        resolver <- o .: "resolver"
-        config <- parseJSON $ Object o
+        flags <- o ..:? "flags" ..!= mempty
+        resolver <- o ..: "resolver"
+        config <- parseConfigMonoidJSON o
         let project = Project
                 { projectPackages = dirs
                 , projectExtraDeps = extraDeps
@@ -823,3 +873,29 @@ packageEntryCurrDir = PackageEntry
     , peLocation = PLFilePath "."
     , peSubdirs = []
     }
+
+-- | A software control system.
+data SCM = Git
+  deriving (Show)
+
+instance FromJSON SCM where
+    parseJSON v = do
+        s <- parseJSON v
+        case s of
+            "git" -> return Git
+            _ -> fail ("Unknown or unsupported SCM: " <> s)
+
+instance ToJSON SCM where
+    toJSON Git = toJSON ("git" :: Text)
+
+-- | Key used for the YAML file and templates.
+authorEmailKey :: Text
+authorEmailKey = "author-email"
+
+-- | Key used for the YAML file and templates.
+authorNameKey :: Text
+authorNameKey = "author-name"
+
+-- | Key used for the YAML file and templates.
+scmInitKey :: Text
+scmInitKey = "scm-init"

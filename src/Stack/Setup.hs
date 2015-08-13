@@ -17,14 +17,16 @@ module Stack.Setup
 
 import           Control.Applicative
 import           Control.Exception.Enclosed (catchIO)
-import           Control.Monad (liftM, when, join, void)
+import           Control.Monad (liftM, when, join, void, unless)
 import           Control.Monad.Catch
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Control.Monad.Logger
 import           Control.Monad.Reader (MonadReader, ReaderT (..), asks)
 import           Control.Monad.State (get, put, modify)
 import           Control.Monad.Trans.Control
+import           Crypto.Hash (SHA1(SHA1))
 import           Data.Aeson.Extended
+import           Data.ByteString (ByteString)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Char8 as S8
 import           Data.Conduit (Conduit, ($$), (=$), await, yield, awaitForever)
@@ -49,13 +51,15 @@ import qualified Data.Yaml as Yaml
 import           Distribution.System (OS (..), Arch (..), Platform (..))
 import           Distribution.Text (simpleParse)
 import           Network.HTTP.Client.Conduit
-import           Network.HTTP.Download (verifiedDownload, DownloadRequest(..), drRetriesDefault)
+import           Network.HTTP.Download.Verified
 import           Path
 import           Path.IO
 import           Prelude -- Fix AMP warning
 import           Safe (headMay, readMay)
-import           Stack.Build.Types
+import           Stack.Types.Build
+import           Stack.Config (resolvePackageEntry)
 import           Stack.Constants (distRelativeDir)
+import           Stack.Fetch
 import           Stack.GhcPkg (createDatabase, getCabalPkgVer, getGlobalDB)
 import           Stack.Solver (getGhcVersion)
 import           Stack.Types
@@ -67,6 +71,7 @@ import qualified System.FilePath as FP
 import           System.IO.Temp (withSystemTempDirectory)
 import           System.Process (rawSystem)
 import           System.Process.Read
+import           System.Process.Run (runIn)
 import           Text.Printf (printf)
 
 data SetupOpts = SetupOpts
@@ -82,6 +87,9 @@ data SetupOpts = SetupOpts
     -- ^ Don't check for a compatible GHC version/architecture
     , soptsSkipMsys :: !Bool
     -- ^ Do not use a custom msys installation on Windows
+    , soptsUpgradeCabal :: !Bool
+    -- ^ Upgrade the global Cabal library in the database to the newest
+    -- version. Only works reliably with a stack-managed installation.
     }
     deriving Show
 data SetupException = UnsupportedSetupCombo OS Arch
@@ -133,6 +141,7 @@ setupEnv = do
             , soptsSanityCheck = False
             , soptsSkipGhcCheck = configSkipGHCCheck $ bcConfig bconfig
             , soptsSkipMsys = configSkipMsys $ bcConfig bconfig
+            , soptsUpgradeCabal = False
             }
     mghcBin <- ensureGHC sopts
     menv0 <- getMinimalEnvOverride
@@ -152,10 +161,14 @@ setupEnv = do
     menv <- mkEnvOverride platform env
     ghcVer <- getGhcVersion menv
     cabalVer <- getCabalPkgVer menv
+    packages <- mapM
+        (resolvePackageEntry menv (bcRoot bconfig))
+        (bcPackageEntries bconfig)
     let envConfig0 = EnvConfig
             { envConfigBuildConfig = bconfig
             , envConfigCabalVersion = cabalVer
             , envConfigGhcVersion = ghcVer
+            , envConfigPackages = Map.fromList $ concat packages
             }
 
     -- extra installation bin directories
@@ -221,6 +234,7 @@ setupEnv = do
             }
         , envConfigCabalVersion = cabalVer
         , envConfigGhcVersion = ghcVer
+        , envConfigPackages = envConfigPackages envConfig0
         }
 
 -- | Augment the PATH environment variable with the given extra paths
@@ -241,6 +255,12 @@ ensureGHC :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env m, HasConfi
           => SetupOpts
           -> m (Maybe [FilePath])
 ensureGHC sopts = do
+    when (getMajorVersion expected < MajorVersion 7 8) $ do
+        $logWarn "stack will almost certainly fail with GHC below version 7.8"
+        $logWarn "Valiantly attempting to run anyway, but I know this is doomed"
+        $logWarn "For more information, see: https://github.com/commercialhaskell/stack/issues/648"
+        $logWarn ""
+
     -- Check the available GHCs
     menv0 <- getMinimalEnvOverride
 
@@ -293,22 +313,90 @@ ensureGHC sopts = do
             return $ Just $ map toFilePathNoTrailingSlash $ concat paths
         else return Nothing
 
-    when (soptsSanityCheck sopts) $ do
-        menv <-
-            case mpaths of
-                Nothing -> return menv0
-                Just paths -> do
-                    config <- asks getConfig
-                    let m0 = unEnvOverride menv0
-                        path0 = Map.lookup "PATH" m0
-                        path = augmentPath paths path0
-                        m = Map.insert "PATH" path m0
-                    mkEnvOverride (configPlatform config) (removeHaskellEnvVars m)
-        sanityCheck menv
+    menv <-
+        case mpaths of
+            Nothing -> return menv0
+            Just paths -> do
+                config <- asks getConfig
+                let m0 = unEnvOverride menv0
+                    path0 = Map.lookup "PATH" m0
+                    path = augmentPath paths path0
+                    m = Map.insert "PATH" path m0
+                mkEnvOverride (configPlatform config) (removeHaskellEnvVars m)
+
+    when (soptsUpgradeCabal sopts) $ do
+        unless needLocal $ do
+            $logWarn "Trying to upgrade Cabal library on a GHC not installed by stack."
+            $logWarn "This may fail, caveat emptor!"
+
+        upgradeCabal menv
+
+    when (soptsSanityCheck sopts) $ sanityCheck menv
 
     return mpaths
   where
     expected = soptsExpected sopts
+
+-- | Install the newest version of Cabal globally
+upgradeCabal :: (MonadIO m, MonadLogger m, MonadReader env m, HasHttpManager env, HasConfig env, MonadBaseControl IO m, MonadMask m)
+             => EnvOverride
+             -> m ()
+upgradeCabal menv = do
+    let name = $(mkPackageName "Cabal")
+    rmap <- resolvePackages menv Set.empty (Set.singleton name)
+    newest <-
+        case Map.keys rmap of
+            [] -> error "No Cabal library found in index, cannot upgrade"
+            [PackageIdentifier name' version]
+                | name == name' -> return version
+            x -> error $ "Unexpected results for resolvePackages: " ++ show x
+    installed <- getCabalPkgVer menv
+    if installed >= newest
+        then $logInfo $ T.concat
+            [ "Currently installed Cabal is "
+            , T.pack $ versionString installed
+            , ", newest is "
+            , T.pack $ versionString newest
+            , ". I'm not upgrading Cabal."
+            ]
+        else withSystemTempDirectory "stack-cabal-upgrade" $ \tmpdir -> do
+            $logInfo $ T.concat
+                [ "Installing Cabal-"
+                , T.pack $ versionString newest
+                , " to replace "
+                , T.pack $ versionString installed
+                ]
+            tmpdir' <- parseAbsDir tmpdir
+            let ident = PackageIdentifier name newest
+            m <- unpackPackageIdents menv tmpdir' Nothing (Set.singleton ident)
+
+            ghcPath <- join $ findExecutable menv "ghc"
+            newestDir <- parseRelDir $ versionString newest
+            let installRoot = toFilePath $ parent (parent ghcPath)
+                                       </> $(mkRelDir "new-cabal")
+                                       </> newestDir
+
+            dir <-
+                case Map.lookup ident m of
+                    Nothing -> error $ "upgradeCabal: Invariant violated, dir missing"
+                    Just dir -> return dir
+
+            runIn dir "ghc" menv ["Setup.hs"] Nothing
+            let setupExe = toFilePath $ dir </> $(mkRelFile "Setup")
+                dirArgument name' = concat
+                    [ "--"
+                    , name'
+                    , "dir="
+                    , installRoot FP.</> name'
+                    ]
+            runIn dir setupExe menv
+                ( "configure"
+                : map dirArgument (words "lib bin data doc")
+                )
+                Nothing
+            runIn dir setupExe menv ["build"] Nothing
+            runIn dir setupExe menv ["install"] Nothing
+            $logInfo "New Cabal library installed"
 
 -- | Get the major version of the system GHC, if available
 getSystemGHC :: (MonadIO m, MonadLogger m, MonadBaseControl IO m, MonadCatch m) => EnvOverride -> m (Maybe (Version, Arch))
@@ -325,24 +413,52 @@ getSystemGHC menv = do
                 Just (version, arch)
         else return Nothing
 
-data DownloadPair = DownloadPair Version Text
+data DownloadInfo = DownloadInfo
+    { downloadInfoUrl :: Text
+    , downloadInfoContentLength :: Int
+    , downloadInfoSha1 :: Maybe ByteString
+    }
     deriving Show
-instance FromJSON DownloadPair where
-    parseJSON = withObject "DownloadPair" $ \o -> DownloadPair
-        <$> o .: "version"
-        <*> o .: "url"
+
+data VersionedDownloadInfo = VersionedDownloadInfo
+    { vdiVersion :: Version
+    , vdiDownloadInfo :: DownloadInfo
+    }
+    deriving Show
+
+parseDownloadInfoFromObject :: Yaml.Object -> Yaml.Parser DownloadInfo
+parseDownloadInfoFromObject o = do
+    url           <- o .: "url"
+    contentLength <- o .: "content-length"
+    sha1TextMay   <- o .:? "sha1"
+    return DownloadInfo
+        { downloadInfoUrl = url
+        , downloadInfoContentLength = contentLength
+        , downloadInfoSha1 = fmap T.encodeUtf8 sha1TextMay
+        }
+
+instance FromJSON DownloadInfo where
+    parseJSON = withObject "DownloadInfo" parseDownloadInfoFromObject
+instance FromJSON VersionedDownloadInfo where
+    parseJSON = withObject "VersionedDownloadInfo" $ \o -> do
+        version <- o .: "version"
+        downloadInfo <- parseDownloadInfoFromObject o
+        return VersionedDownloadInfo
+            { vdiVersion = version
+            , vdiDownloadInfo = downloadInfo
+            }
 
 data SetupInfo = SetupInfo
-    { siSevenzExe :: Text
-    , siSevenzDll :: Text
-    , siPortableGit :: DownloadPair
-    , siGHCs :: Map Text (Map MajorVersion DownloadPair)
+    { siSevenzExe :: DownloadInfo
+    , siSevenzDll :: DownloadInfo
+    , siPortableGit :: VersionedDownloadInfo
+    , siGHCs :: Map Text (Map MajorVersion VersionedDownloadInfo)
     }
     deriving Show
 instance FromJSON SetupInfo where
     parseJSON = withObject "SetupInfo" $ \o -> SetupInfo
-        <$> o .: "sevenzexe"
-        <*> o .: "sevenzdll"
+        <$> o .: "sevenzexe-info"
+        <*> o .: "sevenzdll-info"
         <*> o .: "portable-git"
         <*> o .: "ghc"
 
@@ -435,7 +551,7 @@ ensureTool menv sopts installed getSetupInfo' msystem (name, mversion)
                 return Nothing
     | otherwise = do
         si <- getSetupInfo'
-        (pair@(DownloadPair version _), installer) <-
+        (VersionedDownloadInfo version downloadInfo, installer) <-
             case packageNameString name of
                 "git" -> do
                     let pair = siPortableGit si
@@ -463,7 +579,7 @@ ensureTool menv sopts installed getSetupInfo' msystem (name, mversion)
                 x -> error $ "Invariant violated: ensureTool on " ++ x
         let ident = PackageIdentifier name version
 
-        (file, at) <- downloadPair pair ident
+        (file, at) <- downloadFromInfo downloadInfo ident
         dir <- installDir ident
         unmarkInstalled ident
         installer si file at dir ident
@@ -514,11 +630,11 @@ getOSKey menv = do
     hasLineWithFirstWord w =
       elem (Just w) . map (headMay . T.words) . T.lines . T.decodeUtf8With T.lenientDecode
 
-downloadPair :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env m, HasConfig env, HasHttpManager env, MonadBaseControl IO m)
-             => DownloadPair
+downloadFromInfo :: (MonadIO m, MonadMask m, MonadLogger m, MonadReader env m, HasConfig env, HasHttpManager env, MonadBaseControl IO m)
+             => DownloadInfo
              -> PackageIdentifier
              -> m (Path Abs File, ArchiveType)
-downloadPair (DownloadPair _ url) ident = do
+downloadFromInfo downloadInfo ident = do
     config <- asks getConfig
     at <-
         case extension of
@@ -528,9 +644,10 @@ downloadPair (DownloadPair _ url) ident = do
             _ -> error $ "Unknown extension: " ++ extension
     relfile <- parseRelFile $ packageIdentifierString ident ++ extension
     let path = configLocalPrograms config </> relfile
-    chattyDownload (packageIdentifierText ident) url path
+    chattyDownload (packageIdentifierText ident) downloadInfo path
     return (path, at)
   where
+    url = downloadInfoUrl downloadInfo
     extension =
         loop $ T.unpack url
       where
@@ -556,7 +673,7 @@ installGHCPosix _ archiveFile archiveType destDir ident = do
     platform <- asks getPlatform
     menv0 <- getMinimalEnvOverride
     menv <- mkEnvOverride platform (removeHaskellEnvVars (unEnvOverride menv0))
-    $logInfo $ "menv = " <> T.pack (show (unEnvOverride menv))
+    $logDebug $ "menv = " <> T.pack (show (unEnvOverride menv))
     zipTool' <-
         case archiveType of
             TarXz -> return "xz"
@@ -697,11 +814,12 @@ setup7z si config = do
     dll = dir </> $(mkRelFile "7z.dll")
 
 chattyDownload :: (MonadReader env m, HasHttpManager env, MonadIO m, MonadLogger m, MonadThrow m, MonadBaseControl IO m)
-               => Text
-               -> Text -- ^ URL
+               => Text          -- ^ label
+               -> DownloadInfo  -- ^ URL, content-length, and sha1
                -> Path Abs File -- ^ destination
                -> m ()
-chattyDownload label url path = do
+chattyDownload label downloadInfo path = do
+    let url = downloadInfoUrl downloadInfo
     req <- parseUrl $ T.unpack url
     $logSticky $ T.concat
       [ "Preparing to download "
@@ -715,12 +833,25 @@ chattyDownload label url path = do
       , T.pack $ toFilePath path
       , " ..."
       ]
-
+    hashChecks <- case downloadInfoSha1 downloadInfo of
+        Just sha1ByteString -> do
+            let sha1 = CheckHexDigestByteString sha1ByteString
+            $logDebug $ T.concat
+                [ "Will check against sha1 hash: "
+                , T.decodeUtf8With T.lenientDecode sha1ByteString
+                ]
+            return [HashCheck SHA1 sha1]
+        Nothing -> do
+            $logWarn $ T.concat
+                [ "No sha1 found in metadata,"
+                , " download hash won't be checked."
+                ]
+            return []
     let dReq = DownloadRequest
             { drRequest = req
-            , drHashChecks = []
-            , drLengthCheck = Nothing
-            , drRetries = drRetriesDefault
+            , drHashChecks = hashChecks
+            , drLengthCheck = Just totalSize
+            , drRetryPolicy = drRetryPolicyDefault
             }
     runInBase <- liftBaseWith $ \run -> return (void . run)
     x <- verifiedDownload dReq path (chattyDownloadProgress runInBase)
@@ -728,7 +859,8 @@ chattyDownload label url path = do
         then $logStickyDone ("Downloaded " <> label <> ".")
         else $logStickyDone "Already downloaded."
   where
-    chattyDownloadProgress runInBase mcontentLength = do
+    totalSize = downloadInfoContentLength downloadInfo
+    chattyDownloadProgress runInBase _ = do
         _ <- liftIO $ runInBase $ $logSticky $
           label <> ": download has begun"
         CL.map (Sum . S.length)
@@ -739,14 +871,22 @@ chattyDownload label url path = do
             modify (+ size)
             totalSoFar <- get
             liftIO $ runInBase $ $logSticky $ T.pack $
-              case mcontentLength of
-                Nothing -> chattyProgressNoTotal totalSoFar
-                Just 0 -> chattyProgressNoTotal totalSoFar
-                Just total -> chattyProgressWithTotal totalSoFar total
-        -- Example: ghc: 42.13 KiB downloaded...
-        chattyProgressNoTotal totalSoFar =
-            printf ("%s: " <> bytesfmt "%7.2f" totalSoFar <> " downloaded...")
-                   (T.unpack label)
+                chattyProgressWithTotal totalSoFar totalSize
+
+        -- Note(DanBurton): Total size is now always known in this file.
+        -- However, printing in the case where it isn't known may still be
+        -- useful in other parts of the codebase.
+        -- So I'm just commenting out the code rather than deleting it.
+
+        --      case mcontentLength of
+        --        Nothing -> chattyProgressNoTotal totalSoFar
+        --        Just 0 -> chattyProgressNoTotal totalSoFar
+        --        Just total -> chattyProgressWithTotal totalSoFar total
+        ---- Example: ghc: 42.13 KiB downloaded...
+        --chattyProgressNoTotal totalSoFar =
+        --    printf ("%s: " <> bytesfmt "%7.2f" totalSoFar <> " downloaded...")
+        --           (T.unpack label)
+
         -- Example: ghc: 50.00 MiB / 100.00 MiB (50.00%) downloaded...
         chattyProgressWithTotal totalSoFar total =
           printf ("%s: " <>

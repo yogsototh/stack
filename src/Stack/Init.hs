@@ -8,19 +8,20 @@ module Stack.Init
     , InitOpts (..)
     , SnapPref (..)
     , Method (..)
+    , makeConcreteResolver
     ) where
 
 import           Control.Exception               (assert)
 import           Control.Exception.Enclosed      (handleIO, catchAny)
 import           Control.Monad                   (liftM, when)
-import           Control.Monad.Catch             (MonadMask, throwM)
+import           Control.Monad.Catch             (MonadMask, throwM, MonadThrow)
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger
-import           Control.Monad.Reader            (MonadReader)
+import           Control.Monad.Reader            (MonadReader, asks)
 import           Control.Monad.Trans.Control     (MonadBaseControl)
 import qualified Data.IntMap                     as IntMap
-import           Data.List                       (sort)
-import           Data.List                       (isSuffixOf)
+import           Data.List                       (isSuffixOf,sort)
+import           Data.List.Extra                 (nubOrd)
 import           Data.Map                        (Map)
 import qualified Data.Map                        as Map
 import           Data.Maybe                      (mapMaybe)
@@ -59,10 +60,10 @@ ignoredDirs = Set.fromList
 
 -- | Generate stack.yaml
 initProject :: (MonadIO m, MonadMask m, MonadReader env m, HasConfig env, HasHttpManager env, MonadLogger m, MonadBaseControl IO m)
-            => InitOpts
+            => Path Abs Dir
+            -> InitOpts
             -> m ()
-initProject initOpts = do
-    currDir <- getWorkingDir
+initProject currDir initOpts = do
     let dest = currDir </> stackDotYaml
         dest' = toFilePath dest
     exists <- fileExists dest
@@ -142,7 +143,8 @@ getDefaultResolver cabalfps gpds initOpts =
                 Just (snap, flags) ->
                     return (ResolverSnapshot snap, flags, Map.empty)
                 Nothing -> throwM $ NoMatchingSnapshot names
-        MethodResolver resolver -> do
+        MethodResolver aresolver -> do
+            resolver <- makeConcreteResolver aresolver
             mpair <-
                 case resolver of
                     ResolverSnapshot name -> findBuildPlan gpds [name]
@@ -153,7 +155,7 @@ getDefaultResolver cabalfps gpds initOpts =
                     return (ResolverSnapshot snap, flags, Map.empty)
                 Nothing -> return (resolver, Map.empty, Map.empty)
         MethodSolver -> do
-            (ghcVersion, extraDeps) <- cabalSolver (map parent cabalfps) []
+            (ghcVersion, extraDeps) <- cabalSolver (map parent cabalfps) Map.empty []
             return
                 ( ResolverGhc ghcVersion
                 , Map.filter (not . Map.null) $ fmap snd extraDeps
@@ -206,14 +208,34 @@ data InitOpts = InitOpts
 data SnapPref = PrefNone | PrefLTS | PrefNightly
 
 -- | Method of initializing
-data Method = MethodSnapshot SnapPref | MethodResolver Resolver | MethodSolver
+data Method = MethodSnapshot SnapPref | MethodResolver AbstractResolver | MethodSolver
 
--- | Same semantics as @nub@, but more efficient by using the @Ord@ constraint.
-nubOrd :: Ord a => [a] -> [a]
-nubOrd =
-    go Set.empty
-  where
-    go _ [] = []
-    go s (x:xs)
-        | x `Set.member` s = go s xs
-        | otherwise = x : go (Set.insert x s) xs
+-- | Turn an 'AbstractResolver' into a 'Resolver'.
+makeConcreteResolver :: (MonadIO m, MonadReader env m, HasConfig env, MonadThrow m, HasHttpManager env, MonadLogger m)
+                     => AbstractResolver
+                     -> m Resolver
+makeConcreteResolver (ARResolver r) = return r
+makeConcreteResolver ar = do
+    snapshots <- getSnapshots
+    r <-
+        case ar of
+            ARResolver r -> assert False $ return r
+            ARGlobal -> do
+                stackRoot <- asks $ configStackRoot . getConfig
+                let fp = implicitGlobalDir stackRoot </> stackDotYaml
+                (ProjectAndConfigMonoid project _, _warnings) <-
+                    liftIO (Yaml.decodeFileEither $ toFilePath fp)
+                    >>= either throwM return
+                return $ projectResolver project
+            ARLatestNightly -> return $ ResolverSnapshot $ Nightly $ snapshotsNightly snapshots
+            ARLatestLTSMajor x ->
+                case IntMap.lookup x $ snapshotsLts snapshots of
+                    Nothing -> error $ "No LTS release found with major version " ++ show x
+                    Just y -> return $ ResolverSnapshot $ LTS x y
+            ARLatestLTS
+                | IntMap.null $ snapshotsLts snapshots -> error $ "No LTS releases found"
+                | otherwise ->
+                    let (x, y) = IntMap.findMax $ snapshotsLts snapshots
+                     in return $ ResolverSnapshot $ LTS x y
+    $logInfo $ "Selected resolver: " <> resolverName r
+    return r

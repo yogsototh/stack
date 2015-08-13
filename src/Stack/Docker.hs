@@ -11,11 +11,11 @@ module Stack.Docker
   ,dockerOptsFromMonoid
   ,dockerPullCmdName
   ,execWithOptionalContainer
-  ,execWithRequiredContainer
   ,preventInContainer
   ,pull
   ,reexecWithOptionalContainer
   ,reset
+  ,reExecArgName
   ) where
 
 import           Control.Applicative
@@ -33,6 +33,7 @@ import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import           Data.Char (isSpace,toUpper,isAscii)
 import           Data.List (dropWhileEnd,find,intercalate,intersperse,isPrefixOf,isInfixOf,foldl',sortBy)
+import           Data.List.Extra (trim)
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import           Data.Maybe
@@ -45,71 +46,98 @@ import           Data.Typeable (Typeable)
 import           Path
 import           Path.IO (getWorkingDir,listDirectory,createTree,removeFile,removeTree,dirExists)
 import           Stack.Constants (projectDockerSandboxDir,stackProgName,stackDotYaml,stackRootEnvVar)
-import           Stack.Exec
 import           Stack.Types
 import           Stack.Types.Internal
 import           Stack.Docker.GlobalDB
 import           System.Environment (lookupEnv,getProgName,getArgs,getExecutablePath)
+import           System.Exit (exitSuccess, exitWith)
 import           System.FilePath (dropTrailingPathSeparator,takeBaseName)
 import           System.Info (arch,os)
 import           System.IO (stderr,stdin,stdout,hIsTerminalDevice)
 import           System.Process.PagerEditor (editByteString)
 import           System.Process.Read
 import           System.Process.Run
+import           System.Process (CreateProcess(delegate_ctlc))
 import           Text.Printf (printf)
+
+#ifndef mingw32_HOST_OS
+import           Control.Monad.Trans.Control (liftBaseWith)
+import           System.Posix.Signals
+#endif
 
 -- | If Docker is enabled, re-runs the currently running OS command in a Docker container.
 -- Otherwise, runs the inner action.
+--
+-- This takes an optional release action which should be taken IFF control is
+-- transfering away from the current process to the intra-container one.  The main use
+-- for this is releasing a lock.  After launching reexecution, the host process becomes
+-- nothing but an manager for the call into docker and thus may not hold the lock.
 reexecWithOptionalContainer
     :: M env m
     => Maybe (Path Abs Dir)
+    -> Maybe (m ())
     -> IO ()
+    -> Maybe (m ())
+    -> Maybe (m ())
     -> m ()
 reexecWithOptionalContainer mprojectRoot =
   execWithOptionalContainer mprojectRoot getCmdArgs
   where
     getCmdArgs =
-      do args <- getArgs
+      do args <- (("--" ++ reExecArgName) :) <$> getArgs
          if arch == "x86_64" && os == "linux"
              then do exePath <- getExecutablePath
                      let mountPath = concat ["/opt/host/bin/",takeBaseName exePath]
                      return (mountPath
                             ,args
+                            ,[]
                             ,\c -> c{configDocker=(configDocker c)
                                                   {dockerMount=Mount exePath mountPath :
                                                                dockerMount (configDocker c)}})
              else do progName <- getProgName
-                     return (takeBaseName progName,args,id)
+                     return (takeBaseName progName,args,[],id)
 
 -- | If Docker is enabled, re-runs the OS command returned by the second argument in a
 -- Docker container.  Otherwise, runs the inner action.
+--
+-- This takes an optional release action just like `reexecWithOptionalContainer`.
 execWithOptionalContainer
     :: M env m
     => Maybe (Path Abs Dir)
-    -> IO (FilePath,[String],Config -> Config)
+    -> IO (FilePath,[String],[(String,String)],Config -> Config)
+    -> Maybe (m ())
     -> IO ()
+    -> Maybe (m ())
+    -> Maybe (m ())
     -> m ()
-execWithOptionalContainer mprojectRoot getCmdArgs inner =
+execWithOptionalContainer mprojectRoot getCmdArgs mbefore inner mafter mrelease =
   do config <- asks getConfig
      inContainer <- getInContainer
-     if inContainer || not (dockerEnable (configDocker config))
-        then liftIO inner
-        else do (cmd_,args,modConfig) <- liftIO getCmdArgs
-                runContainerAndExit modConfig mprojectRoot cmd_ args []
-
--- | If Docker is enabled, re-runs the OS command returned by the second argument in a
--- Docker container.  Otherwise, throws 'DockerMustBeEnabledException'.
-execWithRequiredContainer
-    :: M env m
-    => Maybe (Path Abs Dir)
-    -> IO (FilePath,[String],Config -> Config)
-    -> m ()
-execWithRequiredContainer mprojectRoot getCmdArgs =
-  do config <- asks getConfig
-     unless (dockerEnable (configDocker config))
-          (throwM DockerMustBeEnabledException)
-     (cmd_,args,modConfig) <- liftIO getCmdArgs
-     runContainerAndExit modConfig mprojectRoot cmd_ args []
+     isReExec <- asks getReExec
+     if | inContainer && not isReExec && (isJust mbefore || isJust mafter) ->
+            throwM OnlyOnHostException
+        | inContainer ->
+            liftIO (do inner
+                       exitSuccess)
+        | not (dockerEnable (configDocker config)) ->
+            do fromMaybeAction mbefore
+               liftIO inner
+               fromMaybeAction mafter
+               liftIO exitSuccess
+        | otherwise ->
+            do (cmd_,args,envVars,modConfig) <- liftIO getCmdArgs
+               fromMaybeAction mrelease
+               runContainerAndExit
+                 modConfig
+                 mprojectRoot
+                 (fromMaybeAction mbefore)
+                 cmd_
+                 args
+                 envVars
+                 (fromMaybeAction mafter)
+  where
+    fromMaybeAction Nothing = return ()
+    fromMaybeAction (Just hook) = hook
 
 -- | Error if running in a container.
 preventInContainer :: (MonadIO m,MonadThrow m) => m () -> m ()
@@ -121,35 +149,36 @@ preventInContainer inner =
 
 -- | 'True' if we are currently running inside a Docker container.
 getInContainer :: (MonadIO m) => m Bool
-getInContainer =
-  do maybeEnvVar <- liftIO (lookupEnv inContainerEnvVar)
-     case maybeEnvVar of
-       Nothing -> return False
-       Just _ -> return True
+getInContainer = liftIO (isJust <$> lookupEnv inContainerEnvVar)
 
 -- | Run a command in a new Docker container, then exit the process.
 runContainerAndExit :: M env m
                     => (Config -> Config)
                     -> Maybe (Path Abs Dir)
+                    -> m ()
                     -> FilePath
                     -> [String]
                     -> [(String, String)]
                     -> m ()
+                    -> m ()
 runContainerAndExit modConfig
                     mprojectRoot
+                    before
                     cmnd
                     args
-                    envVars =
+                    envVars
+                    after =
   do config <- fmap modConfig (asks getConfig)
      let docker = configDocker config
      envOverride <- getEnvOverride (configPlatform config)
      checkDockerVersion envOverride
      uidOut <- readProcessStdout Nothing envOverride "id" ["-u"]
      gidOut <- readProcessStdout Nothing envOverride "id" ["-g"]
-     (dockerHost,dockerCertPath,dockerTlsVerify) <-
-       liftIO ((,,) <$> lookupEnv "DOCKER_HOST"
-                    <*> lookupEnv "DOCKER_CERT_PATH"
-                    <*> lookupEnv "DOCKER_TLS_VERIFY")
+     (dockerHost,dockerCertPath,bamboo,jenkins) <-
+       liftIO ((,,,) <$> lookupEnv "DOCKER_HOST"
+                     <*> lookupEnv "DOCKER_CERT_PATH"
+                     <*> lookupEnv "bamboo_buildKey"
+                     <*> lookupEnv "JENKINS_HOME")
      isStdoutTerminal <- asks getTerminal
      (isStdinTerminal,isStderrTerminal) <-
        liftIO ((,) <$> hIsTerminalDevice stdin
@@ -157,7 +186,7 @@ runContainerAndExit modConfig
      pwd <- getWorkingDir
      when (maybe False (isPrefixOf "tcp://") dockerHost &&
            maybe False (isInfixOf "boot2docker") dockerCertPath)
-          ($logWarn "WARNING: Using boot2docker is NOT supported, and not likely to perform well.")
+          ($logWarn "Warning: Using boot2docker is NOT supported, and not likely to perform well.")
      let image = dockerImage docker
      maybeImageInfo <- inspect envOverride image
      imageInfo <- case maybeImageInfo of
@@ -173,20 +202,7 @@ runContainerAndExit modConfig
      let uid = dropWhileEnd isSpace (decodeUtf8 uidOut)
          gid = dropWhileEnd isSpace (decodeUtf8 gidOut)
          imageEnvVars = map (break (== '=')) (icEnv (iiConfig imageInfo))
-         (sandboxID,oldImage) =
-           case lookupImageEnv sandboxIDEnvVar imageEnvVars of
-             Just x -> (x,False)
-             Nothing ->
-               --EKB TODO: remove this and oldImage after lts-1.x images no longer in use
-               let sandboxName = maybe "default" id (lookupImageEnv "SANDBOX_NAME" imageEnvVars)
-                   maybeImageCabalRemoteRepoName = lookupImageEnv "CABAL_REMOTE_REPO_NAME" imageEnvVars
-                   maybeImageStackageSlug = lookupImageEnv "STACKAGE_SLUG" imageEnvVars
-                   maybeImageStackageDate = lookupImageEnv "STACKAGE_DATE" imageEnvVars
-               in (case (maybeImageStackageSlug,maybeImageStackageDate) of
-                     (Just stackageSlug,_) -> sandboxName ++ "_" ++ stackageSlug
-                     (_,Just stackageDate) -> sandboxName ++ "_" ++ stackageDate
-                     _ -> sandboxName ++ maybe "" ("_" ++) maybeImageCabalRemoteRepoName
-                  ,True)
+         sandboxID = fromMaybe "default" (lookupImageEnv sandboxIDEnvVar imageEnvVars)
      sandboxIDDir <- parseRelDir (sandboxID ++ "/")
      let stackRoot = configStackRoot config
          sandboxDir = projectDockerSandboxDir projectRoot
@@ -195,7 +211,12 @@ runContainerAndExit modConfig
          sandboxRepoDir = sandboxDir </> sandboxIDDir
          sandboxSubdirs = map (\d -> sandboxRepoDir </> d)
                               sandboxedHomeSubdirectories
-         isTerm = isStdinTerminal && isStdoutTerminal && isStderrTerminal
+         isTerm = not (dockerDetach docker) &&
+                  isStdinTerminal &&
+                  isStdoutTerminal &&
+                  isStderrTerminal
+         keepStdinOpen = not (dockerDetach docker) &&
+                         (isTerm || (isNothing bamboo && isNothing jenkins))
      liftIO
        (do updateDockerImageLastUsed config
                                      (iiId imageInfo)
@@ -204,11 +225,10 @@ runContainerAndExit modConfig
            mapM_ createTree
                  (concat [[sandboxHomeDir, sandboxSandboxDir, stackRoot] ++
                           sandboxSubdirs]))
-     exec
-       plainEnvSettings
-       "docker"
+     containerID <- (trim . decodeUtf8) <$> readDockerProcess
+       envOverride
        (concat
-         [["run"
+         [["create"
           ,"--net=host"
           ,"-e",inContainerEnvVar ++ "=1"
           ,"-e",stackRootEnvVar ++ "=" ++ toFPNoTrailingSep stackRoot
@@ -223,39 +243,47 @@ runContainerAndExit modConfig
           ,"-v",toFPNoTrailingSep sandboxHomeDir ++ ":" ++ toFPNoTrailingSep sandboxRepoDir
           ,"-v",toFPNoTrailingSep stackRoot ++ ":" ++
                 toFPNoTrailingSep (sandboxRepoDir </> $(mkRelDir ("." ++ stackProgName ++ "/")))]
-         ,if oldImage
-            then ["-e",sandboxIDEnvVar ++ "=" ++ sandboxID
-                 ,"--entrypoint=/root/entrypoint.sh"]
-            else []
-         ,case (dockerPassHost docker,dockerHost) of
-            (True,Just x@('u':'n':'i':'x':':':'/':'/':s)) -> ["-e","DOCKER_HOST=" ++ x
-                                                             ,"-v",s ++ ":" ++ s]
-            (True,Just x) -> ["-e","DOCKER_HOST=" ++ x]
-            (True,Nothing) -> ["-v","/var/run/docker.sock:/var/run/docker.sock"]
-            (False,_) -> []
-         ,case (dockerPassHost docker,dockerCertPath) of
-            (True,Just x) -> ["-e","DOCKER_CERT_PATH=" ++ x
-                             ,"-v",x ++ ":" ++ x]
-            _ -> []
-         ,case (dockerPassHost docker,dockerTlsVerify) of
-            (True,Just x )-> ["-e","DOCKER_TLS_VERIFY=" ++ x]
-            _ -> []
+         ,concatMap (\(k,v) -> ["-e", k ++ "=" ++ v]) envVars
          ,concatMap sandboxSubdirArg sandboxSubdirs
          ,concatMap mountArg (dockerMount docker)
          ,case dockerContainerName docker of
             Just name -> ["--name=" ++ name]
             Nothing -> []
-         ,if dockerDetach docker
-             then ["-d"]
-             else concat [["--rm" | not (dockerPersist docker)]
-                         ,["-t" | isTerm]
-                         ,["-i" | isTerm]]
+         ,["-t" | isTerm]
+         ,["-i" | keepStdinOpen]
          ,dockerRunArgs docker
          ,[image]
-         ,map (\(k,v) -> k ++ "=" ++ v) envVars
          ,[cmnd]
          ,args])
-
+     before
+#ifndef mingw32_HOST_OS
+     runInBase <- liftBaseWith $ \run -> return (void . run)
+     oldHandlers <- forM (concat [[(sigINT,sigTERM) | not keepStdinOpen]
+                                 ,[(sigTERM,sigTERM)]]) $ \(sigIn,sigOut) -> do
+       let sigHandler = runInBase (readProcessNull Nothing envOverride "docker"
+                                     ["kill","--signal=" ++ show sigOut,containerID])
+       oldHandler <- liftIO $ installHandler sigIn (Catch sigHandler) Nothing
+       return (sigIn, oldHandler)
+#endif
+     e <- try (callProcess'
+                 (if keepStdinOpen then id else (\cp -> cp { delegate_ctlc = False }))
+                 Nothing
+                 envOverride
+                 "docker"
+                 (concat [["start"]
+                         ,["-a" | not (dockerDetach docker)]
+                         ,["-i" | keepStdinOpen]
+                         ,[containerID]]))
+#ifndef mingw32_HOST_OS
+     forM_ oldHandlers $ \(sig,oldHandler) ->
+       liftIO $ installHandler sig oldHandler Nothing
+#endif
+     unless (dockerPersist docker || dockerDetach docker)
+            (readProcessNull Nothing envOverride "docker" ["rm","-f",containerID])
+     case e of
+       Left (ProcessExitedUnsuccessfully _ ec) -> liftIO (exitWith ec)
+       Right () -> do after
+                      liftIO exitSuccess
   where
     lookupImageEnv name vars =
       case lookup name vars of
@@ -528,7 +556,7 @@ pull =
      pullImage envOverride docker (dockerImage docker)
 
 -- | Pull Docker image from registry.
-pullImage :: (MonadLogger m,MonadIO m,MonadThrow m)
+pullImage :: (MonadLogger m,MonadIO m,MonadThrow m,MonadBaseControl IO m)
           => EnvOverride -> DockerOpts -> String -> m ()
 pullImage envOverride docker image =
   do $logInfo (concatT ["Pulling image from registry: '",image,"'"])
@@ -543,7 +571,7 @@ pullImage envOverride docker image =
                    ,maybe [] (\u -> ["--username=" ++ u]) (dockerRegistryUsername docker)
                    ,maybe [] (\p -> ["--password=" ++ p]) (dockerRegistryPassword docker)
                    ,[takeWhile (/= '/') image]]))
-     e <- liftIO (try (callProcess Nothing envOverride "docker" ["pull",image]))
+     e <- try (callProcess Nothing envOverride "docker" ["pull",image])
      case e of
        Left (ProcessExitedUnsuccessfully _ _) -> throwM (PullFailedException image)
        Right () -> return ()
@@ -648,7 +676,6 @@ dockerOptsFromMonoid mproject stackRoot DockerOptsMonoid{..} = DockerOpts
   ,dockerContainerName = emptyToNothing dockerMonoidContainerName
   ,dockerRunArgs = dockerMonoidRunArgs
   ,dockerMount = dockerMonoidMount
-  ,dockerPassHost = fromMaybe False dockerMonoidPassHost
   ,dockerDatabasePath =
      case dockerMonoidDatabasePath of
        Nothing -> stackRoot </> $(mkRelFile "docker.db")
@@ -691,6 +718,10 @@ dockerPullCmdName = "pull"
 -- | Command-line argument for @docker cleanup@.
 dockerCleanupCmdName :: String
 dockerCleanupCmdName = "cleanup"
+
+-- | Command-line option for @--internal-re-exec@.
+reExecArgName :: String
+reExecArgName = "internal-re-exec"
 
 -- | Options for 'cleanup'.
 data CleanupOpts = CleanupOpts
@@ -861,4 +892,4 @@ instance Show StackDockerException where
     concat ["Invalid database path: ",show ex]
 
 type M env m = (MonadIO m,MonadReader env m,MonadLogger m,MonadBaseControl IO m,MonadCatch m
-               ,HasConfig env,HasTerminal env)
+               ,HasConfig env,HasTerminal env,HasReExec env)

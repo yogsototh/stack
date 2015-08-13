@@ -16,7 +16,7 @@ import           Network.HTTP.Client.Conduit (HasHttpManager, getHttpManager)
 import           Path
 import qualified Paths_stack as Paths
 import           Stack.Build
-import           Stack.Build.Types
+import           Stack.Types.Build
 import           Stack.Config
 import           Stack.Fetch
 import           Stack.PackageIndex
@@ -27,9 +27,9 @@ import           Stack.Types.StackT
 import           System.IO.Temp              (withSystemTempDirectory)
 import           System.Process.Run
 
-upgrade :: (MonadIO m, MonadMask m, MonadReader env m, HasConfig env, HasHttpManager env, MonadLogger m, HasTerminal env, HasLogLevel env, MonadBaseControl IO m)
+upgrade :: (MonadIO m, MonadMask m, MonadReader env m, HasConfig env, HasHttpManager env, MonadLogger m, HasTerminal env, HasReExec env, HasLogLevel env, MonadBaseControl IO m)
         => Bool -- ^ use Git?
-        -> Maybe Resolver
+        -> Maybe AbstractResolver
         -> m ()
 upgrade fromGit mresolver = withSystemTempDirectory "stack-upgrade" $ \tmp' -> do
     menv <- getMinimalEnvOverride
@@ -75,16 +75,18 @@ upgrade fromGit mresolver = withSystemTempDirectory "stack-upgrade" $ \tmp' -> d
     manager <- asks getHttpManager
     logLevel <- asks getLogLevel
     terminal <- asks getTerminal
+    reExec <- asks getReExec
     configMonoid <- asks $ configConfigMonoid . getConfig
 
     forM_ mdir $ \dir -> liftIO $ do
-        bconfig <- runStackLoggingT manager logLevel terminal $ do
+        bconfig <- runStackLoggingT manager logLevel terminal reExec $ do
             lc <- loadConfig
                 configMonoid
                 (Just $ dir </> $(mkRelFile "stack.yaml"))
-            lcLoadBuildConfig lc mresolver ThrowException
-        envConfig1 <- runStackT manager logLevel bconfig terminal setupEnv
-        runStackT manager logLevel envConfig1 terminal $ build (const $ return ()) defaultBuildOpts
+            lcLoadBuildConfig lc mresolver
+        envConfig1 <- runStackT manager logLevel bconfig terminal reExec setupEnv
+        runStackT manager logLevel envConfig1 terminal reExec $
+          build (const $ return ()) Nothing defaultBuildOpts
             { boptsTargets = ["stack"]
             , boptsInstallExes = True
             }

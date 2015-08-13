@@ -13,13 +13,13 @@ module Stack.Options
     ,initOptsParser
     ,newOptsParser
     ,logLevelOptsParser
-    ,resolverOptsParser
+    ,ghciOptsParser
+    ,abstractResolverOptsParser
     ,solverOptsParser
     ,testOptsParser
     ) where
 
 import           Control.Monad.Logger (LogLevel(..))
-import           Data.Attoparsec.Args (EscapingMode (Escaping), parseArgs)
 import           Data.Char (isSpace, toLower)
 import           Data.List.Split (splitOn)
 import qualified Data.Map as Map
@@ -28,16 +28,18 @@ import           Data.Maybe
 import           Data.Monoid
 import qualified Data.Set as Set
 import qualified Data.Text as T
+import           Data.Text.Read (decimal)
 import           Options.Applicative.Args
 import           Options.Applicative.Builder.Extra
 import           Options.Applicative.Simple
 import           Options.Applicative.Types (readerAsk)
-import           Stack.Build.Types
+import           Stack.Config (packagesParser)
 import           Stack.Docker
 import qualified Stack.Docker as Docker
 import           Stack.Dot
+import           Stack.Ghci (GhciOpts(..))
 import           Stack.Init
-import           Stack.New (NewOpts(..))
+import           Stack.New
 import           Stack.Types
 
 -- | Command sum type for conditional arguments.
@@ -46,6 +48,7 @@ data Command
     | Test
     | Haddock
     | Bench
+    | Install
     deriving (Eq)
 
 -- | Parser for bench arguments.
@@ -56,22 +59,32 @@ benchOptsParser = BenchmarkOpts
                                  help ("Forward BENCH_ARGS to the benchmark suite. " <>
                                        "Supports templates from `cabal bench`")))
 
+addCoverageFlags :: BuildOpts -> BuildOpts
+addCoverageFlags bopts
+    | toCoverage $ boptsTestOpts bopts
+        = bopts { boptsGhcOptions = "-fhpc" : boptsGhcOptions bopts }
+    | otherwise = bopts
+
 -- | Parser for build arguments.
 buildOptsParser :: Command
-                -> Bool -- ^ default copy-bins value
                 -> Parser BuildOpts
-buildOptsParser cmd defCopyBins =
+buildOptsParser cmd =
+            fmap addCoverageFlags $
             BuildOpts <$> target <*> libProfiling <*> exeProfiling <*>
-            optimize <*> haddock <*> haddockDeps <*> finalAction <*> dryRun <*> ghcOpts <*>
-            flags <*> copyBins <*> preFetch <*> onlySnapshot <*>
-            fileWatch' <*> keepGoing <*> forceDirty
+            optimize <*> haddock <*> haddockDeps <*> dryRun <*> ghcOpts <*>
+            flags <*> copyBins <*> preFetch <*>
+            buildSubset <*>
+            fileWatch' <*> keepGoing <*> forceDirty <*>
+            tests <*> testOptsParser <*>
+            benches <*> benchOptsParser <*>
+            many exec
   where optimize =
           maybeBoolFlags "optimizations" "optimizations for TARGETs and all its dependencies" idm
         target =
           fmap (map T.pack)
                 (many (strArgument
                          (metavar "TARGET" <>
-                          help "If none specified, use all packages defined in current directory")))
+                          help "If none specified, use all packages")))
         libProfiling =
           boolFlags False
                     "library-profiling"
@@ -85,7 +98,7 @@ buildOptsParser cmd defCopyBins =
         haddock =
           boolFlags (cmd == Haddock)
                     "haddock"
-                    "building Haddocks"
+                    "generating Haddocks the project(s) in this directory/configuration"
                     idm
         haddockDeps =
           if cmd == Haddock
@@ -94,9 +107,8 @@ buildOptsParser cmd defCopyBins =
                             "building Haddocks for dependencies"
                             idm
              else pure Nothing
-        finalAction = pure DoNothing
 
-        copyBins = boolFlags defCopyBins
+        copyBins = boolFlags (cmd == Install)
             "copy-bins"
             "copying binaries to the local-bin-path (see 'stack path')"
             idm
@@ -124,9 +136,15 @@ buildOptsParser cmd defCopyBins =
         preFetch = flag False True
             (long "prefetch" <>
              help "Fetch packages necessary for the build immediately, useful with --dry-run")
-        onlySnapshot = flag False True
-            (long "only-snapshot" <>
-             help "Only build packages for the snapshot database, not the local database")
+
+        buildSubset =
+            flag' BSOnlySnapshot
+                (long "only-snapshot" <>
+                 help "Only build packages for the snapshot database, not the local database")
+            <|> flag' BSOnlyDependencies
+                (long "only-dependencies" <>
+                 help "Only build packages that are dependencies of targets on the command line")
+            <|> pure BSAll
 
         fileWatch' = flag False True
             (long "file-watch" <>
@@ -140,6 +158,22 @@ buildOptsParser cmd defCopyBins =
         forceDirty = flag False True
             (long "force-dirty" <>
              help "Force treating all local packages as having dirty files (useful for cases where stack can't detect a file change)")
+
+
+        tests = boolFlags (cmd == Test)
+            "test"
+            "testing the project(s) in this directory/configuration"
+            idm
+
+        benches = boolFlags (cmd == Bench)
+            "bench"
+            "benchmarking the project(s) in this directory/configuration"
+            idm
+
+        exec = cmdOption
+            ( long "exec" <>
+              metavar "CMD [ARGS]" <>
+              help "Command and arguments to run after a successful build" )
 
 -- | Parser for package:[-]flag
 readFlag :: ReadM (Map (Maybe PackageName) (Map FlagName Bool))
@@ -270,19 +304,16 @@ dockerOptsParser showOptions =
                         hide <>
                         metavar "NAME" <>
                         help "Docker container name")
-    <*> argsStrOption (long (dockerOptName dockerRunArgsArgName) <>
-                        hide <>
-                        value [] <>
-                        metavar "'ARG1 [ARG2 ...]'" <>
-                        help "Additional arguments to pass to 'docker run'")
+    <*> argsOption (long (dockerOptName dockerRunArgsArgName) <>
+                    hide <>
+                    value [] <>
+                    metavar "'ARG1 [ARG2 ...]'" <>
+                    help "Additional options to pass to 'docker run'")
     <*> many (option auto (long (dockerOptName dockerMountArgName) <>
                            hide <>
                            metavar "(PATH | HOST-PATH:CONTAINER-PATH)" <>
                            help ("Mount volumes from host in container " ++
                                  "(may specify mutliple times)")))
-    <*> maybeBoolFlags (dockerOptName dockerPassHostArgName)
-                       "passing Docker daemon connection information into container"
-                       hide
     <*> maybeStrOption (long (dockerOptName dockerDatabasePathArgName) <>
                         hide <>
                         metavar "PATH" <>
@@ -290,7 +321,6 @@ dockerOptsParser showOptions =
   where
     dockerOptName optName = dockerCmdName ++ "-" ++ T.unpack optName
     maybeStrOption = optional . option str
-    argsStrOption = option (fmap (either error id . parseArgs Escaping . T.pack) str)
     hide = if showOptions
               then idm
               else internal <> hidden
@@ -371,6 +401,26 @@ dotOptsParser = DotOpts
         splitNames :: String -> [String]
         splitNames = map (takeWhile (not . isSpace) . dropWhile isSpace) . splitOn ","
 
+ghciOptsParser :: Parser GhciOpts
+ghciOptsParser = GhciOpts
+             <$> fmap (map T.pack)
+                   (many (strArgument
+                            (metavar "TARGET" <>
+                             help ("If none specified, " <>
+                                   "use all packages defined in current directory"))))
+             <*> fmap concat (many (argsOption (long "ghc-options" <>
+                    metavar "OPTION" <>
+                    help "Additional options passed to GHCi")))
+             <*> strOption (long "with-ghc" <>
+                            metavar "GHC" <>
+                            help "Use this command for the GHC to run" <>
+                            value "ghc" <>
+                            showDefault)
+             <*> flag False True (long "no-load" <>
+                   help "Don't load modules on start-up")
+             <*> packagesParser
+
+
 -- | Parser for exec command
 execOptsParser :: Maybe String -- ^ command
                -> Parser ExecOpts
@@ -413,9 +463,13 @@ execOptsParser mcmd =
 -- | Parser for global command-line options.
 globalOptsParser :: Bool -> Parser GlobalOpts
 globalOptsParser defaultTerminal =
-    GlobalOpts <$> logLevelOptsParser <*>
+    GlobalOpts <$>
+    switch (long Docker.reExecArgName <>
+            hidden <>
+            internal) <*>
+    logLevelOptsParser <*>
     configOptsParser False <*>
-    optional resolverOptsParser <*>
+    optional abstractResolverOptsParser <*>
     flag
         defaultTerminal
         False
@@ -457,7 +511,7 @@ initOptsParser =
              help "Prefer Nightly snapshots over LTS snapshots") <|>
         pure PrefNone
 
-    resolver = option readResolver
+    resolver = option readAbstractResolver
         (long "resolver" <>
          metavar "RESOLVER" <>
          help "Use the given resolver, even if not all dependencies are met")
@@ -490,19 +544,26 @@ logLevelOptsParser =
             _ -> LevelOther (T.pack s)
 
 -- | Parser for the resolver
-resolverOptsParser :: Parser Resolver
-resolverOptsParser =
-    option readResolver
+abstractResolverOptsParser :: Parser AbstractResolver
+abstractResolverOptsParser =
+    option readAbstractResolver
         (long "resolver" <>
          metavar "RESOLVER" <>
          help "Override resolver in project file")
 
-readResolver :: ReadM Resolver
-readResolver = do
+readAbstractResolver :: ReadM AbstractResolver
+readAbstractResolver = do
     s <- readerAsk
-    case parseResolverText $ T.pack s of
-        Left e -> readerError $ show e
-        Right x -> return x
+    case s of
+        "global" -> return ARGlobal
+        "nightly" -> return ARLatestNightly
+        "lts" -> return ARLatestLTS
+        'l':'t':'s':'-':x | Right (x', "") <- decimal $ T.pack x ->
+            return $ ARLatestLTSMajor x'
+        _ ->
+            case parseResolverText $ T.pack s of
+                Left e -> readerError $ show e
+                Right x -> return $ ARResolver x
 
 -- | Parser for @solverCmd@
 solverOptsParser :: Parser Bool
@@ -531,18 +592,16 @@ testOptsParser = TestOpts
                (long "no-run-tests" <>
                 help "Disable running of tests. (Tests will still be built.)")
 
-newOptsParser :: Parser NewOpts
-newOptsParser =
-    NewOpts <$> templateRepositoryParser
-            <*> optional templateParser
-            <*> many templateArgParser
-            <*> initOptsParser
+-- | Parser for @stack new@.
+newOptsParser :: Parser (NewOpts,InitOpts)
+newOptsParser = (,) <$> newOpts <*> initOptsParser
   where
-    templateRepositoryParser = strOption
-         $ long "template-url-base"
-        <> metavar "URL"
-        <> value "raw.githubusercontent.com/commercialhaskell/stack-templates/master/"
-    -- TODO(DanBurton): reject argument if it has a colon.
-    templateParser = strArgument $ metavar "TEMPLATE"
-    -- TODO(DanBurton): reject argument if it doesn't have a colon.
-    templateArgParser = strArgument $ metavar "ARG:VAL"
+    newOpts =
+        NewOpts <$>
+        packageNameArgument
+            (metavar "PACKAGE_NAME" <> help "A valid package name.") <*>
+        templateNameArgument
+            (metavar "TEMPLATE_NAME" <>
+             help "Name of a template, for example: foo or foo.hsfiles" <>
+             value defaultTemplateName) <*
+        abortOption ShowHelpText (long "help" <> help "Show help text.")

@@ -23,18 +23,18 @@
 module Stack.Config
   (loadConfig
   ,packagesParser
+  ,resolvePackageEntry
   ) where
 
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Compression.GZip as GZip
 import           Control.Applicative
-import           Control.Concurrent (getNumCapabilities)
 import           Control.Exception (IOException)
 import           Control.Monad
 import           Control.Monad.Catch (Handler(..), MonadCatch, MonadThrow, catches, throwM)
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger hiding (Loc)
-import           Control.Monad.Reader (MonadReader, ask, runReaderT)
+import           Control.Monad.Reader (MonadReader, ask, asks, runReaderT)
 import           Control.Monad.Trans.Control (MonadBaseControl)
 import qualified Crypto.Hash.SHA256 as SHA256
 import           Data.Aeson.Extended
@@ -50,6 +50,7 @@ import qualified Data.Yaml as Yaml
 import           Distribution.System (OS (..), Platform (..), buildPlatform)
 import qualified Distribution.Text
 import           Distribution.Version (simplifyVersionRange)
+import           GHC.Conc (getNumProcessors)
 import           Network.HTTP.Client.Conduit (HasHttpManager, getHttpManager, Manager, parseUrl)
 import           Network.HTTP.Download (download)
 import           Options.Applicative (Parser, strOption, long, help)
@@ -161,9 +162,13 @@ configFromConfigMonoid configStackRoot mproject configMonoid@ConfigMonoid{..} = 
                  ]
      configJobs <-
         case configMonoidJobs of
-            Nothing -> liftIO getNumCapabilities
+            Nothing -> liftIO getNumProcessors
             Just i -> return i
      let configConcurrentTests = fromMaybe True configMonoidConcurrentTests
+
+     let configAuthorEmail = configMonoidAuthorEmail
+         configAuthorName = configMonoidAuthorName
+         configScmInit = configMonoidScmInit
 
      return Config {..}
 
@@ -207,35 +212,27 @@ loadConfig configArgs mstackYaml = do
             Just (_, _, projectConfig) -> configArgs : projectConfig : extraConfigs
     unless (fromCabalVersion Meta.version `withinRange` configRequireStackVersion config)
         (throwM (BadStackVersionException (configRequireStackVersion config)))
-    menv <- runReaderT getMinimalEnvOverride config
     return $ LoadConfig
         { lcConfig          = config
-        , lcLoadBuildConfig = loadBuildConfig menv mproject config stackRoot
+        , lcLoadBuildConfig = loadBuildConfig mproject config stackRoot
         , lcProjectRoot     = fmap (\(_, fp, _) -> parent fp) mproject
         }
 
 -- | Load the build configuration, adds build-specific values to config loaded by @loadConfig@.
 -- values.
 loadBuildConfig :: (MonadLogger m, MonadIO m, MonadCatch m, MonadReader env m, HasHttpManager env, MonadBaseControl IO m, HasTerminal env)
-                => EnvOverride
-                -> Maybe (Project, Path Abs File, ConfigMonoid)
+                => Maybe (Project, Path Abs File, ConfigMonoid)
                 -> Config
                 -> Path Abs Dir
-                -> Maybe Resolver -- override resolver
-                -> NoBuildConfigStrategy
+                -> Maybe AbstractResolver -- override resolver
                 -> m BuildConfig
-loadBuildConfig menv mproject config stackRoot mresolver noConfigStrat = do
+loadBuildConfig mproject config stackRoot mresolver = do
     env <- ask
     let miniConfig = MiniConfig (getHttpManager env) config
     (project', stackYamlFP) <- case mproject of
       Just (project, fp, _) -> return (project, fp)
-      Nothing -> case noConfigStrat of
-        ThrowException -> do
-            currDir <- getWorkingDir
-            cabalFiles <- findCabalFiles True currDir
-            throwM $ NoProjectConfigFound currDir
-                $ Just $ if null cabalFiles then "new" else "init"
-        ExecStrategy -> do
+      Nothing -> do
+            $logInfo "Run from outside a project, using implicit global config"
             let dest :: Path Abs File
                 dest = destDir </> stackDotYaml
                 destDir = implicitGlobalDir stackRoot
@@ -251,8 +248,15 @@ loadBuildConfig menv mproject config stackRoot mresolver noConfigStrat = do
                            Nothing ->
                                $logInfo ("Using resolver: " <> resolverName (projectResolver project) <>
                                          " from global config file: " <> T.pack dest')
-                           Just resolver ->
-                               $logInfo ("Using resolver: " <> resolverName resolver <>
+                           Just aresolver -> do
+                               let name =
+                                        case aresolver of
+                                            ARResolver resolver -> resolverName resolver
+                                            ARLatestNightly -> "nightly"
+                                            ARLatestLTS -> "lts"
+                                            ARLatestLTSMajor x -> T.pack $ "lts-" ++ show x
+                                            ARGlobal -> "global"
+                               $logInfo ("Using resolver: " <> name <>
                                          " specified on command line")
                    return (project, dest)
                else do
@@ -268,9 +272,15 @@ loadBuildConfig menv mproject config stackRoot mresolver noConfigStrat = do
                            }
                    liftIO $ Yaml.encodeFile dest' p
                    return (p, dest)
-    let project = project'
-            { projectResolver = fromMaybe (projectResolver project') mresolver
-            }
+    resolver <-
+        case mresolver of
+            Nothing -> return $ projectResolver project'
+            Just aresolver -> do
+                manager <- asks getHttpManager
+                runReaderT
+                    (makeConcreteResolver aresolver)
+                    (MiniConfig manager config)
+    let project = project' { projectResolver = resolver }
 
     ghcVersion <-
         case projectResolver project of
@@ -279,22 +289,18 @@ loadBuildConfig menv mproject config stackRoot mresolver noConfigStrat = do
                 return $ mbpGhcVersion mbp
             ResolverGhc m -> return $ fromMajorVersion m
             ResolverCustom _name url -> do
-                mbp <- runReaderT (parseCustomMiniBuildPlan url) miniConfig
+                mbp <- runReaderT (parseCustomMiniBuildPlan stackYamlFP url) miniConfig
                 return $ mbpGhcVersion mbp
-
-    let root = parent stackYamlFP
-    packages' <- mapM (resolvePackageEntry menv root) (projectPackages project)
-    let packages = Map.fromList $ concat packages'
 
     return BuildConfig
         { bcConfig = config
         , bcResolver = projectResolver project
         , bcGhcVersionExpected = ghcVersion
-        , bcPackages = packages
+        , bcPackageEntries = projectPackages project
         , bcExtraDeps = projectExtraDeps project
-        , bcRoot = root
         , bcStackYaml = stackYamlFP
         , bcFlags = projectFlags project
+        , bcImplicitGlobal = isNothing mproject
         }
 
 -- | Resolve a PackageEntry into a list of paths, downloading and cloning as
@@ -418,10 +424,14 @@ getExtraConfigs stackRoot = liftIO $ do
         : maybe [] return (mstackGlobalConfig <|> defaultStackGlobalConfig)
 
 -- | Load and parse YAML from the given file.
-loadYaml :: (FromJSON a,MonadIO m) => Path Abs File -> m a
-loadYaml path =
-    liftIO $ Yaml.decodeFileEither (toFilePath path)
-         >>= either (throwM . ParseConfigFileException path) return
+loadYaml :: (FromJSON (a, [JSONWarning]), MonadIO m, MonadLogger m) => Path Abs File -> m a
+loadYaml path = do
+    (result,warnings) <-
+        liftIO $
+        Yaml.decodeFileEither (toFilePath path) >>=
+        either (throwM . ParseConfigFileException path) return
+    logJSONWarnings (toFilePath path) warnings
+    return result
 
 -- | Get the location of the project config file, if it exists.
 getProjectConfig :: (MonadIO m, MonadThrow m, MonadLogger m)

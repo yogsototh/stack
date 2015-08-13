@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -10,31 +11,38 @@
 module Main where
 
 import           Control.Exception
+import qualified Control.Exception.Lifted as EL
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Logger
-import           Control.Monad.Reader (ask)
+import           Control.Monad.Reader (ask, asks)
+import           Control.Monad.Trans.Control (MonadBaseControl)
 import           Data.Attoparsec.Args (withInterpreterArgs)
+import qualified Data.ByteString.Lazy as L
+import           Data.IORef
 import           Data.List
 import qualified Data.List as List
+import qualified Data.Map as Map
+import qualified Data.Map.Strict as M
 import           Data.Maybe
 import           Data.Monoid
 import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
-import           Data.Traversable
+import           Data.Traversable (sequenceA)
 import           Network.HTTP.Client
 import           Options.Applicative.Args
 import           Options.Applicative.Builder.Extra
 import           Options.Applicative.Simple
 import           Options.Applicative.Types (readerAsk)
 import           Path
+import           Path.IO
 import qualified Paths_stack as Meta
 import           Plugins
 import           Prelude hiding (pi)
 import           Stack.Build
-import           Stack.Build.Types
+import           Stack.Types.Build
 import           Stack.Config
 import           Stack.Constants
 import qualified Stack.Docker as Docker
@@ -47,8 +55,10 @@ import qualified Stack.Image as Image
 import           Stack.Init
 import           Stack.New
 import           Stack.Options
+import           Stack.Package (getCabalFileName)
 import qualified Stack.PackageIndex
-import           Stack.Repl
+import           Stack.Ghci
+import           Stack.SDist (getSDistTarball)
 import           Stack.Setup
 import           Stack.Solver (solveExtraDeps)
 import           Stack.Types
@@ -56,17 +66,69 @@ import           Stack.Types.Internal
 import           Stack.Types.StackT
 import           Stack.Upgrade
 import qualified Stack.Upload as Upload
-import           System.Directory (canonicalizePath)
+import           System.Directory (canonicalizePath, doesFileExist, doesDirectoryExist, createDirectoryIfMissing)
 import           System.Environment (getArgs, getProgName)
 import           System.Exit
+import           System.FileLock (lockFile, tryLockFile, unlockFile, SharedExclusive(Exclusive), FileLock)
 import           System.FilePath (dropTrailingPathSeparator)
 import           System.IO (hIsTerminalDevice, stderr, stdin, stdout, hSetBuffering, BufferMode(..))
 import           System.Process.Read
 
+#if WINDOWS
+import System.Win32.Console (setConsoleCP, setConsoleOutputCP, getConsoleCP, getConsoleOutputCP)
+import System.IO (hSetEncoding, utf8, hPutStrLn)
+#endif
+
+-- | Set the code page for this process as necessary. Only applies to Windows.
+-- See: https://github.com/commercialhaskell/stack/issues/738
+fixCodePage :: IO a -> IO a
+#if WINDOWS
+fixCodePage inner = do
+    origCPI <- getConsoleCP
+    origCPO <- getConsoleOutputCP
+
+    let setInput = origCPI /= expected
+        setOutput = origCPO /= expected
+        fixInput
+            | setInput = bracket_
+                (do
+                    setConsoleCP expected
+                    hSetEncoding stdin utf8
+                    )
+                (setConsoleCP origCPI)
+            | otherwise = id
+        fixOutput
+            | setInput = bracket_
+                (do
+                    setConsoleOutputCP expected
+                    hSetEncoding stdout utf8
+                    hSetEncoding stderr utf8
+                    )
+                (setConsoleOutputCP origCPO)
+            | otherwise = id
+
+    case (setInput, setOutput) of
+        (False, False) -> return ()
+        (True, True) -> warn ""
+        (True, False) -> warn " input"
+        (False, True) -> warn " output"
+
+    fixInput $ fixOutput inner
+  where
+    expected = 65001 -- UTF-8
+    warn typ = hPutStrLn stderr $ concat
+        [ "Setting"
+        , typ
+        , " codepage to UTF-8 (65001) to ensure correct output from GHC"
+        ]
+#else
+fixCodePage = id
+#endif
+
 -- | Commandline dispatcher.
 main :: IO ()
-main = withInterpreterArgs stackProgName $ \args isInterpreter ->
-  do -- Line buffer the output by default, particularly for non-terminal runs.
+main = withInterpreterArgs stackProgName $ \args isInterpreter -> do
+     -- Line buffer the output by default, particularly for non-terminal runs.
      -- See https://github.com/commercialhaskell/stack/pull/360
      hSetBuffering stdout LineBuffering
      hSetBuffering stdin  LineBuffering
@@ -90,36 +152,36 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter ->
           globalOptsParser isTerminal)
          (do addCommand "build"
                         "Build the project(s) in this directory/configuration"
-                        (buildCmd DoNothing)
-                        (buildOptsParser Build False)
+                        (buildCmd Nothing)
+                        (buildOptsParser Build)
              addCommand "install"
-                        "Identical to 'build --copy-bins', not actually a managed installation tool!"
-                        installCmd
-                        (buildOptsParser Build True)
+                        "Shortcut for 'build --copy-bins'"
+                        (buildCmd $ Just ("install", "copy-bins"))
+                        (buildOptsParser Install)
              addCommand "uninstall"
                         "DEPRECATED: This command performs no actions, and is present for documentation only"
                         uninstallCmd
                         (many $ strArgument $ metavar "IGNORED")
              addCommand "test"
-                        "Build and test the project(s) in this directory/configuration"
-                        (\(bopts, topts) ->
-                             let bopts' = if toCoverage topts
-                                             then bopts { boptsGhcOptions = "-fhpc" : boptsGhcOptions bopts}
-                                             else bopts
-                             in buildCmd (DoTests topts) bopts')
-                        ((,) <$> buildOptsParser Test False <*> testOptsParser)
+                        "Shortcut for 'build --test'"
+                        (buildCmd $ Just ("test", "test"))
+                        (buildOptsParser Test)
              addCommand "bench"
-                        "Build and benchmark the project(s) in this directory/configuration"
-                        (\(bopts, beopts) -> buildCmd (DoBenchmarks beopts) bopts)
-                        ((,) <$> buildOptsParser Bench False <*> benchOptsParser)
+                        "Shortcut for 'build --bench'"
+                        (buildCmd $ Just ("bench", "bench"))
+                        (buildOptsParser Bench)
              addCommand "haddock"
-                        "Generate haddocks for the project(s) in this directory/configuration"
-                        (buildCmd DoNothing)
-                        (buildOptsParser Haddock False)
+                        "Shortcut for 'build --haddock'"
+                        (buildCmd $ Just ("haddock", "haddock"))
+                        (buildOptsParser Haddock)
              addCommand "new"
-                        "Create a brand new project"
+                        "Create a new project from a template. Run `stack templates' to see available templates."
                         newCmd
                         newOptsParser
+             addCommand "templates"
+                        "List the templates available for `stack new'."
+                        templatesCmd
+                        (pure ())
              addCommand "init"
                         "Initialize a stack project based on one or more cabal packages"
                         initCmd
@@ -164,6 +226,10 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter ->
                         "Upload a package to Hackage"
                         uploadCmd
                         (many $ strArgument $ metavar "TARBALL/DIR")
+             addCommand "sdist"
+                        "Create source distribution tarballs"
+                        sdistCmd
+                        (many $ strArgument $ metavar "DIR")
              addCommand "dot"
                         "Visualize your project's dependency graph using Graphviz dot"
                         dotCmd
@@ -178,36 +244,8 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter ->
                         (execOptsParser $ Just "ghc")
              addCommand "ghci"
                         "Run ghci in the context of project(s)"
-                        replCmd
-                        ((,,,,) <$>
-                         fmap (map T.pack)
-                              (many (strArgument
-                                       (metavar "TARGET" <>
-                                        help "If none specified, use all packages defined in current directory"))) <*>
-                         argsOption (long "ghc-options" <>
-                                      metavar "OPTION" <>
-                                      help "Additional options passed to GHCi" <>
-                                      value []) <*>
-                         strOption (long "with-ghc" <>
-                                    metavar "GHC" <>
-                                    help "Use this command for the GHC to run" <>
-                                    value "ghc" <>
-                                    showDefault) <*>
-                         flag False True (long "no-load" <>
-                                         help "Don't load modules on start-up") <*>
-                         packagesParser)
-             addCommand "ide"
-                        "Run ide-backend-client with the correct arguments"
-                        ideCmd
-                        ((,) <$>
-                         fmap (map T.pack)
-                              (many (strArgument
-                                       (metavar "TARGET" <>
-                                        help "If none specified, use all packages defined in current directory"))) <*>
-                         argsOption (long "ghc-options" <>
-                                     metavar "OPTION" <>
-                                     help "Additional options passed to GHCi" <>
-                                     value []))
+                        ghciCmd
+                        ghciOptsParser
              addCommand "runghc"
                         "Run runghc"
                         execCmd
@@ -216,6 +254,36 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter ->
                         "Clean the local packages"
                         cleanCmd
                         (pure ())
+             addCommand "list-dependencies"
+                        "List the dependencies"
+                        listDependenciesCmd
+                        (T.pack <$> strOption (long "separator" <>
+                                               metavar "SEP" <>
+                                               help ("Separator between package name " <>
+                                                     "and package version.") <>
+                                               value " " <>
+                                               showDefault))
+             addSubCommands
+                 "ide"
+                 "IDE-specific commands"
+                 (do addCommand
+                         "start"
+                         "Start the ide-backend service"
+                         ideCmd
+                         (((,) <$>
+                           fmap (map T.pack)
+                                (many (strArgument
+                                         (metavar "TARGET" <>
+                                          help "If none specified, use all packages defined in current directory"))) <*>
+                           argsOption (long "ghc-options" <>
+                                       metavar "OPTION" <>
+                                       help "Additional options passed to GHCi" <>
+                                       value [])))
+                     addCommand
+                         "packages"
+                         "List all available local loadable packages"
+                         packagesCmd
+                         (pure ()))
              addSubCommands
                Docker.dockerCmdName
                "Subcommands specific to Docker use"
@@ -253,7 +321,7 @@ main = withInterpreterArgs stackProgName $ \args isInterpreter ->
          throwIO exitCode
        Right (global,run) -> do
          when (globalLogLevel global == LevelDebug) $ putStrLn versionString'
-         run global `catch` \e -> do
+         fixCodePage $ run global `catch` \e -> do
             -- This special handler stops "stack: " from being printed before the
             -- exception
             case fromException e of
@@ -291,10 +359,10 @@ pluginShouldHaveRun _plugin _globalOpts = do
 -- support others later).
 pathCmd :: [Text] -> GlobalOpts -> IO ()
 pathCmd keys go =
-    withBuildConfig
+    withBuildConfigAndLock
         go
-        ExecStrategy
-        (do env <- ask
+        (\_ ->
+         do env <- ask
             let cfg = envConfig env
                 bc = envConfigBuildConfig cfg
             menv <- getMinimalEnvOverride
@@ -395,6 +463,14 @@ paths =
       , "local-install-root"
       , \pi ->
              T.pack (toFilePathNoTrailing (piLocalRoot pi)))
+    , ( "Snapshot documentation root"
+      , "snapshot-doc-root"
+      , \pi ->
+             T.pack (toFilePathNoTrailing (piSnapRoot pi </> docDirSuffix)))
+    , ( "Local project documentation root"
+      , "local-doc-root"
+      , \pi ->
+             T.pack (toFilePathNoTrailing (piLocalRoot pi </> docDirSuffix)))
     , ( "Dist work directory"
       , "dist-dir"
       , \pi ->
@@ -404,6 +480,7 @@ paths =
 data SetupCmdOpts = SetupCmdOpts
     { scoGhcVersion :: !(Maybe Version)
     , scoForceReinstall :: !Bool
+    , scoUpgradeCabal :: !Bool
     }
 
 setupParser :: Parser SetupCmdOpts
@@ -414,7 +491,11 @@ setupParser = SetupCmdOpts
                    "The default is to install the version implied by the resolver.")))
     <*> boolFlags False
             "reinstall"
-            "Reinstall GHC, even if available (implies no-system-ghc)"
+            "reinstalling GHC, even if available (implies no-system-ghc)"
+            idm
+    <*> boolFlags False
+            "upgrade-cabal"
+            "installing the newest version of the Cabal library globally"
             idm
   where
     readVersion = do
@@ -426,17 +507,20 @@ setupParser = SetupCmdOpts
 setupCmd :: SetupCmdOpts -> GlobalOpts -> IO ()
 setupCmd SetupCmdOpts{..} go@GlobalOpts{..} = do
   (manager,lc) <- loadConfigWithOpts go
-  runStackT manager globalLogLevel (lcConfig lc) globalTerminal $
+  withUserFileLock (configStackRoot $ lcConfig lc) $ \lk ->
+   runStackTGlobal manager (lcConfig lc) go $
       Docker.reexecWithOptionalContainer
           (lcProjectRoot lc)
-          (runStackLoggingT manager globalLogLevel globalTerminal $ do
+          Nothing
+          (runStackLoggingTGlobal manager go $ do
               (ghc, mstack) <-
                   case scoGhcVersion of
                       Just v -> return (v, Nothing)
                       Nothing -> do
-                          bc <- lcLoadBuildConfig lc globalResolver ExecStrategy
+                          bc <- lcLoadBuildConfig lc globalResolver
                           return (bcGhcVersionExpected bc, Just $ bcStackYaml bc)
-              mpaths <- runStackT manager globalLogLevel (lcConfig lc) globalTerminal $ ensureGHC SetupOpts
+              mpaths <- runStackTGlobal manager (lcConfig lc) go $
+                  ensureGHC SetupOpts
                   { soptsInstallIfMissing = True
                   , soptsUseSystem =
                     (configSystemGHC $ lcConfig lc)
@@ -447,6 +531,7 @@ setupCmd SetupCmdOpts{..} go@GlobalOpts{..} = do
                   , soptsSanityCheck = True
                   , soptsSkipGhcCheck = False
                   , soptsSkipMsys = configSkipMsys $ lcConfig lc
+                  , soptsUpgradeCabal = scoUpgradeCabal
                   }
               case mpaths of
                   Nothing -> $logInfo "stack will use the GHC on your PATH"
@@ -455,104 +540,210 @@ setupCmd SetupCmdOpts{..} go@GlobalOpts{..} = do
               $logInfo "To use this GHC and packages outside of a project, consider using:"
               $logInfo "stack ghc, stack ghci, stack runghc, or stack exec"
               )
+          Nothing
+          (Just $ liftIO$ unlockFile lk)
 
-withConfig :: GlobalOpts
+-- | Enforce mutual exclusion of every action running via this
+-- function, on this path, on this users account.
+--
+-- A lock file is created inside the given directory.  Currently,
+-- stack uses locks per-snapshot.  In the future, stack may refine
+-- this to an even more fine-grain locking approach.
+--
+withUserFileLock :: (MonadBaseControl IO m, MonadIO m)
+                 => Path Abs Dir
+                 -> (FileLock -> m a)
+                 -> m a
+withUserFileLock dir act = do
+    let lockfile = $(mkRelFile "lockfile")
+    let pth = dir </> lockfile
+    liftIO $ createDirectoryIfMissing True (toFilePath dir)
+    -- Just in case of asynchronous exceptions, we need to be careful
+    -- when using tryLockFile here:
+    EL.bracket (liftIO $ tryLockFile (toFilePath pth) Exclusive)
+               (\fstTry -> maybe (return ()) (liftIO . unlockFile) fstTry)
+               (\fstTry ->
+                case fstTry of
+                  Just lk -> EL.finally (act lk) (liftIO $ unlockFile lk)
+                  Nothing ->
+                    do liftIO $ putStrLn $ "Failed to grab lock ("++show pth++
+                                           "); other stack instance running.  Waiting..."
+                       EL.bracket (liftIO $ lockFile (toFilePath pth) Exclusive)
+                                  (liftIO . unlockFile)
+                                  (\lk -> do
+                                    liftIO $ putStrLn "Lock acquired, proceeding."
+                                    act lk))
+
+withConfigAndLock :: GlobalOpts
            -> StackT Config IO ()
            -> IO ()
-withConfig go@GlobalOpts{..} inner = do
+withConfigAndLock go@GlobalOpts{..} inner = do
     (manager, lc) <- loadConfigWithOpts go
-    runStackT manager globalLogLevel (lcConfig lc) globalTerminal $
-        Docker.reexecWithOptionalContainer (lcProjectRoot lc) $
-            runStackT manager globalLogLevel (lcConfig lc) globalTerminal
-                inner
+    withUserFileLock (configStackRoot $ lcConfig lc) $ \lk ->
+     runStackTGlobal manager (lcConfig lc) go $
+        Docker.reexecWithOptionalContainer (lcProjectRoot lc)
+            Nothing
+            (runStackTGlobal manager (lcConfig lc) go inner)
+            Nothing
+            (Just $ liftIO $ unlockFile lk)
 
+-- For now the non-locking version just unlocks immediately.
+-- That is, there's still a serialization point.
 withBuildConfig :: GlobalOpts
-                -> NoBuildConfigStrategy
-                -> StackT EnvConfig IO ()
-                -> IO ()
-withBuildConfig go@GlobalOpts{..} strat inner = do
+               -> (StackT EnvConfig IO ())
+               -> IO ()
+withBuildConfig go inner =
+    withBuildConfigAndLock go (\lk -> do liftIO $ unlockFile lk
+                                         inner)
+
+withBuildConfigAndLock :: GlobalOpts
+                 -> (FileLock -> StackT EnvConfig IO ())
+                 -> IO ()
+withBuildConfigAndLock go inner =
+    withBuildConfigExt go Nothing inner Nothing
+
+withBuildConfigExt
+    :: GlobalOpts
+    -> Maybe (StackT Config IO ())
+    -- ^ Action to perform after before build.  This will be run on the host
+    -- OS even if Docker is enabled for builds.  The build config is not
+    -- available in this action, since that would require build tools to be
+    -- installed on the host OS.
+    -> (FileLock -> StackT EnvConfig IO ())
+    -- ^ Action that uses the build config.  If Docker is enabled for builds,
+    -- this will be run in a Docker container.
+    -> Maybe (StackT Config IO ())
+    -- ^ Action to perform after the build.  This will be run on the host
+    -- OS even if Docker is enabled for builds.  The build config is not
+    -- available in this action, since that would require build tools to be
+    -- installed on the host OS.
+    -> IO ()
+withBuildConfigExt go@GlobalOpts{..} mbefore inner mafter = do
     (manager, lc) <- loadConfigWithOpts go
-    runStackT manager globalLogLevel (lcConfig lc) globalTerminal $
-        Docker.reexecWithOptionalContainer (lcProjectRoot lc) $ do
-            bconfig <- runStackLoggingT manager globalLogLevel globalTerminal $
-                lcLoadBuildConfig lc globalResolver strat
-            envConfig <-
-                runStackT
-                    manager globalLogLevel bconfig globalTerminal
-                    setupEnv
-            runStackT
-                manager
-                globalLogLevel
-                envConfig
-                globalTerminal
-                inner
+
+    withUserFileLock (configStackRoot $ lcConfig lc) $ \lk0 -> do
+      -- A local bit of state for communication between callbacks:
+      curLk <- newIORef lk0
+      let inner' lk =
+            -- Locking policy:  This is only used for build commands, which
+            -- only need to lock the snapshot, not the global lock.  We
+            -- trade in the lock here.
+            do dir <- installationRootDeps
+               -- Hand-over-hand locking:
+               withUserFileLock dir $ \lk2 -> do
+                 liftIO $ writeIORef curLk lk2
+                 liftIO $ unlockFile lk
+                 inner lk2
+
+      let inner'' lk = do
+              bconfig <- runStackLoggingTGlobal manager go $
+                  lcLoadBuildConfig lc globalResolver
+              envConfig <-
+                 runStackTGlobal
+                     manager bconfig go
+                     setupEnv
+              runStackTGlobal
+                  manager
+                  envConfig
+                  go
+                  (inner' lk)
+
+      runStackTGlobal manager (lcConfig lc) go $
+         Docker.reexecWithOptionalContainer (lcProjectRoot lc) mbefore (inner'' lk0) mafter
+                                            (Just $ liftIO $
+                                             do lk' <- readIORef curLk
+                                                unlockFile lk')
 
 cleanCmd :: () -> GlobalOpts -> IO ()
-cleanCmd () go = withBuildConfig go ThrowException clean
+cleanCmd () go = withBuildConfigAndLock go (\_ -> clean)
 
 -- | Helper for build and install commands
-buildCmdHelper :: StackT EnvConfig IO () -- ^ do before build
-               -> NoBuildConfigStrategy -> FinalAction -> BuildOpts -> GlobalOpts -> IO ()
-buildCmdHelper beforeBuild strat finalAction opts go
+buildCmd :: Maybe (Text, Text) -- ^ option synonym
+         -> BuildOpts -> GlobalOpts -> IO ()
+buildCmd moptionSynonym opts go
     | boptsFileWatch opts = fileWatch inner
     | otherwise = inner $ const $ return ()
   where
-    inner setLocalFiles = withBuildConfig go strat $ do
-        beforeBuild
-        Stack.Build.build setLocalFiles opts { boptsFinalAction = finalAction }
-
--- | Build the project.
-buildCmd :: FinalAction -> BuildOpts -> GlobalOpts -> IO ()
-buildCmd = buildCmdHelper (return ()) ThrowException
-
--- | Install
-installCmd :: BuildOpts -> GlobalOpts -> IO ()
-installCmd =
-    buildCmdHelper warning ExecStrategy DoNothing
-  where
-    warning = do
-        $logWarn "NOTE: stack is not a package manager"
-        $logWarn "The install command is only used to copy executables to a destination directory, not manage them"
-        $logWarn "You may want to use 'stack build --copy-bins' for clarity"
-
-copyCmd :: BuildOpts -> GlobalOpts -> IO ()
-copyCmd opts = buildCmdHelper (return ()) ExecStrategy DoNothing opts { boptsInstallExes = True }
+    inner setLocalFiles = withBuildConfigAndLock go $ \lk -> do
+        case moptionSynonym of
+            Nothing -> return ()
+            Just (cmd, opt) -> $logInfo $ T.concat
+                [ "NOTE: the "
+                , cmd
+                , " command is functionally equivalent to 'build --"
+                , opt
+                , "'"
+                ]
+        Stack.Build.build setLocalFiles (Just lk) opts
 
 uninstallCmd :: [String] -> GlobalOpts -> IO ()
-uninstallCmd _ go = withConfig go $ do
+uninstallCmd _ go = withConfigAndLock go $ do
     $logError "stack does not manage installations in global locations"
     $logError "The only global mutation stack performs is executable copying"
     $logError "For the default executable destination, please run 'stack path --local-bin-path'"
 
 -- | Unpack packages to the filesystem
 unpackCmd :: [String] -> GlobalOpts -> IO ()
-unpackCmd names go = withConfig go $ do
+unpackCmd names go = withConfigAndLock go $ do
     menv <- getMinimalEnvOverride
     Stack.Fetch.unpackPackages menv "." names
 
 -- | Update the package index
 updateCmd :: () -> GlobalOpts -> IO ()
-updateCmd () go = withConfig go $
+updateCmd () go = withConfigAndLock go $
     getMinimalEnvOverride >>= Stack.PackageIndex.updateAllIndices
 
 upgradeCmd :: Bool -> GlobalOpts -> IO ()
-upgradeCmd fromGit go = withConfig go $
+upgradeCmd fromGit go = withConfigAndLock go $
     upgrade fromGit (globalResolver go)
 
 -- | Upload to Hackage
 uploadCmd :: [String] -> GlobalOpts -> IO ()
+uploadCmd [] _ = error "To upload the current package, please run 'stack upload .'"
 uploadCmd args go = do
-    (manager,lc) <- loadConfigWithOpts go
-    let config = lcConfig lc
-    if null args
-        then error "To upload the current project, please run 'stack upload .'"
-        else liftIO $ do
-            uploader <- Upload.mkUploader
-                  config
-                $ Upload.setGetManager (return manager)
-                  Upload.defaultUploadSettings
-            mapM_ (Upload.upload uploader) args
+    let partitionM _ [] = return ([], [])
+        partitionM f (x:xs) = do
+            r <- f x
+            (as, bs) <- partitionM f xs
+            return $ if r then (x:as, bs) else (as, x:bs)
+    (files, nonFiles) <- partitionM doesFileExist args
+    (dirs, invalid) <- partitionM doesDirectoryExist nonFiles
+    when (not (null invalid)) $ error $
+        "stack upload expects a list sdist tarballs or cabal directories.  Can't find " ++
+        show invalid
+    let getUploader :: (HasStackRoot config, HasPlatform config, HasConfig config) => StackT config IO Upload.Uploader
+        getUploader = do
+            config <- asks getConfig
+            manager <- asks envManager
+            let uploadSettings =
+                    Upload.setGetManager (return manager) $
+                    Upload.defaultUploadSettings
+            liftIO $ Upload.mkUploader config uploadSettings
+    if null dirs
+        then withConfigAndLock go $ do
+            uploader <- getUploader
+            liftIO $ forM_ files (canonicalizePath >=> Upload.upload uploader)
+        else withBuildConfigAndLock go $ \_ -> do
+            uploader <- getUploader
+            liftIO $ forM_ files (canonicalizePath >=> Upload.upload uploader)
+            forM_ dirs $ \dir -> do
+                pkgDir <- parseAbsDir =<< liftIO (canonicalizePath dir)
+                (tarName, tarBytes) <- getSDistTarball pkgDir
+                liftIO $ Upload.uploadBytes uploader tarName tarBytes
 
+sdistCmd :: [String] -> GlobalOpts -> IO ()
+sdistCmd dirs go =
+    withBuildConfig go $ do -- No locking needed.
+        -- If no directories are specified, build all sdist tarballs.
+        dirs' <- if null dirs
+            then asks (Map.keys . envConfigPackages . getEnvConfig)
+            else mapM (parseAbsDir <=< liftIO . canonicalizePath) dirs
+        forM_ dirs' $ \dir -> do
+            (tarName, tarBytes) <- getSDistTarball dir
+            distDir <- distDirFromDir dir
+            tarPath <- fmap (distDir </>) $ parseRelFile tarName
+            liftIO $ L.writeFile (toFilePath tarPath) tarBytes
+            $logInfo $ "Wrote sdist tarball to " <> T.pack (toFilePath tarPath)
 
 -- | Execute a command.
 execCmd :: ExecOpts -> GlobalOpts -> IO ()
@@ -560,73 +751,102 @@ execCmd ExecOpts {..} go@GlobalOpts{..} =
     case eoExtra of
         ExecOptsPlain -> do
             (manager,lc) <- liftIO $ loadConfigWithOpts go
-            runStackT manager globalLogLevel (lcConfig lc) globalTerminal $
+            withUserFileLock (configStackRoot $ lcConfig lc) $ \lk ->
+             runStackTGlobal manager (lcConfig lc) go $
                 Docker.execWithOptionalContainer
                     (lcProjectRoot lc)
-                    (return (eoCmd, eoArgs, id)) $
-                    runStackT manager globalLogLevel (lcConfig lc) globalTerminal $
-                        exec plainEnvSettings eoCmd eoArgs
+                    (return (eoCmd, eoArgs, [], id))
+                    -- Unlock before transferring control away, whether using docker or not:
+                    (Just $ liftIO $ unlockFile lk)
+                    (runStackTGlobal manager (lcConfig lc) go $ do
+                        exec plainEnvSettings eoCmd eoArgs)
+                    Nothing
+                    Nothing -- Unlocked already above.
         ExecOptsEmbellished {..} ->
-           withBuildConfig go ExecStrategy $ do
+           withBuildConfigAndLock go $ \lk -> do
                let targets = concatMap words eoPackages
                unless (null targets) $
-                   Stack.Build.build (const $ return ()) defaultBuildOpts
+                   Stack.Build.build (const $ return ()) (Just lk) defaultBuildOpts
                        { boptsTargets = map T.pack targets
                        }
+               liftIO $ unlockFile lk -- Unlock before transferring control away.
                exec eoEnvSettings eoCmd eoArgs
 
--- | Run the REPL in the context of a project.
-replCmd :: ([Text], [String], FilePath, Bool, [String]) -> GlobalOpts -> IO ()
-replCmd (targets,args,path,noload,packages) go@GlobalOpts{..} = do
-  withBuildConfig go ExecStrategy $ do
-    let packageTargets = concatMap words packages
+-- | Run GHCi in the context of a project.
+ghciCmd :: GhciOpts -> GlobalOpts -> IO ()
+ghciCmd ghciOpts go@GlobalOpts{..} =
+  withBuildConfigAndLock go $ \lk -> do
+    let packageTargets = concatMap words (ghciAdditionalPackages ghciOpts)
     unless (null packageTargets) $
-       Stack.Build.build (const $ return ()) defaultBuildOpts
+       Stack.Build.build (const $ return ()) (Just lk) defaultBuildOpts
            { boptsTargets = map T.pack packageTargets
            }
-    repl targets args path noload
+    liftIO $ unlockFile lk -- Don't hold the lock while in the GHCI.
+    ghci ghciOpts
 
 -- | Run ide-backend in the context of a project.
 ideCmd :: ([Text], [String]) -> GlobalOpts -> IO ()
-ideCmd (targets,args) go@GlobalOpts{..} = withBuildConfig go ExecStrategy $ do
+ideCmd (targets,args) go@GlobalOpts{..} =
+    withBuildConfig go $ -- No locking needed.
       ide targets args
+
+-- | Run ide-backend in the context of a project.
+packagesCmd :: () -> GlobalOpts -> IO ()
+packagesCmd () go@GlobalOpts{..} =
+    withBuildConfig go $
+      do econfig <- asks getEnvConfig
+         locals <-
+             forM (M.toList (envConfigPackages econfig)) $
+             \(dir,_) ->
+                  do cabalfp <- getCabalFileName dir
+                     parsePackageNameFromFilePath cabalfp
+         forM_ locals (liftIO . putStrLn . packageNameString)
 
 -- | Pull the current Docker image.
 dockerPullCmd :: () -> GlobalOpts -> IO ()
 dockerPullCmd _ go@GlobalOpts{..} = do
     (manager,lc) <- liftIO $ loadConfigWithOpts go
-    runStackT manager globalLogLevel (lcConfig lc) globalTerminal $
-        Docker.preventInContainer Docker.pull
+    -- TODO: can we eliminate this lock if it doesn't touch ~/.stack/?
+    withUserFileLock (configStackRoot $ lcConfig lc) $ \_ ->
+     runStackTGlobal manager (lcConfig lc) go $
+       Docker.preventInContainer Docker.pull
 
 -- | Reset the Docker sandbox.
 dockerResetCmd :: Bool -> GlobalOpts -> IO ()
 dockerResetCmd keepHome go@GlobalOpts{..} = do
     (manager,lc) <- liftIO (loadConfigWithOpts go)
-    runStackLoggingT manager globalLogLevel globalTerminal$ Docker.preventInContainer $
-        Docker.reset (lcProjectRoot lc) keepHome
+    -- TODO: can we eliminate this lock if it doesn't touch ~/.stack/?
+    withUserFileLock (configStackRoot $ lcConfig lc) $ \_ ->
+     runStackLoggingTGlobal manager go $
+        Docker.preventInContainer $ Docker.reset (lcProjectRoot lc) keepHome
 
 -- | Cleanup Docker images and containers.
 dockerCleanupCmd :: Docker.CleanupOpts -> GlobalOpts -> IO ()
 dockerCleanupCmd cleanupOpts go@GlobalOpts{..} = do
     (manager,lc) <- liftIO $ loadConfigWithOpts go
-    runStackT manager globalLogLevel (lcConfig lc) globalTerminal $
+    -- TODO: can we eliminate this lock if it doesn't touch ~/.stack/?
+    withUserFileLock (configStackRoot $ lcConfig lc) $ \_ ->
+     runStackTGlobal manager (lcConfig lc) go $
         Docker.preventInContainer $
             Docker.cleanup cleanupOpts
 
 imgDockerCmd :: () -> GlobalOpts -> IO ()
 imgDockerCmd () go@GlobalOpts{..} = do
-    withBuildConfig
+    withBuildConfigExt
         go
-        ExecStrategy
-        (do Stack.Build.build
+        Nothing
+        (\lk ->
+         do Stack.Build.build
                 (const (return ()))
+                (Just lk)
                 defaultBuildOpts
-            Docker.preventInContainer Image.imageDocker)
+            Image.stageContainerImageArtifacts)
+        (Just Image.createContainerImageFromStage)
 
 -- | Load the configuration with a manager. Convenience function used
 -- throughout this module.
 loadConfigWithOpts :: GlobalOpts -> IO (Manager,LoadConfig (StackLoggingT IO))
-loadConfigWithOpts GlobalOpts{..} = do
+loadConfigWithOpts go@GlobalOpts{..} = do
     manager <- newTLSManager
     mstackYaml <-
         case globalStackYaml of
@@ -634,30 +854,42 @@ loadConfigWithOpts GlobalOpts{..} = do
             Just fp -> do
                 path <- canonicalizePath fp >>= parseAbsFile
                 return $ Just path
-    lc <- runStackLoggingT
+    lc <- runStackLoggingTGlobal
               manager
-              globalLogLevel
-              globalTerminal
+              go
               (loadConfig globalConfigMonoid mstackYaml)
     return (manager,lc)
 
 -- | Project initialization
 initCmd :: InitOpts -> GlobalOpts -> IO ()
-initCmd initOpts go = withConfig go $ initProject initOpts
+initCmd initOpts go =
+    withConfigAndLock go $
+    do pwd <- getWorkingDir
+       initProject pwd initOpts
 
--- | Project creation
-newCmd :: NewOpts -> GlobalOpts -> IO ()
-newCmd newOpts go@GlobalOpts{..} = withConfig go $ do
-    newProject newOpts
-    initProject (newOptsInitOpts newOpts)
+-- | Create a project directory structure and initialize the stack config.
+newCmd :: (NewOpts,InitOpts) -> GlobalOpts -> IO ()
+newCmd (newOpts,initOpts) go@GlobalOpts{..} =
+    withConfigAndLock go $
+    do dir <- new newOpts
+       initProject dir initOpts
+
+-- | List the available templates.
+templatesCmd :: () -> GlobalOpts -> IO ()
+templatesCmd _ go@GlobalOpts{..} = withConfigAndLock go listTemplates
 
 -- | Fix up extra-deps for a project
 solverCmd :: Bool -- ^ modify stack.yaml automatically?
           -> GlobalOpts
           -> IO ()
 solverCmd fixStackYaml go =
-    withBuildConfig go ThrowException (solveExtraDeps fixStackYaml)
+    withBuildConfigAndLock go (\_ -> solveExtraDeps fixStackYaml)
 
 -- | Visualize dependencies
 dotCmd :: DotOpts -> GlobalOpts -> IO ()
-dotCmd dotOpts go = withBuildConfig go ThrowException (dot dotOpts)
+dotCmd dotOpts go = withBuildConfigAndLock go (\_ -> dot dotOpts)
+
+-- | List the dependencies
+listDependenciesCmd :: Text -> GlobalOpts -> IO ()
+listDependenciesCmd sep go = withBuildConfig go (listDependencies sep')
+  where sep' = T.replace "\\t" "\t" (T.replace "\\n" "\n" sep)
