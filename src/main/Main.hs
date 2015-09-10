@@ -761,13 +761,15 @@ uploadCmd (shouldSign,args) go = do
             uploader <- getUploader
             forM_ files (\f -> do liftIO (Upload.upload uploader f)
                                   when shouldSign
-                                    (Sig.sign sigServiceUrl f))
+                                    (do env <- getMinimalEnvOverride
+                                        Sig.sign sigServiceUrl f))
             forM_ dirs $ \dir -> do
                 pkgDir <- parseAbsDir =<< liftIO (canonicalizePath dir)
                 (tarName, tarBytes) <- getSDistTarball pkgDir
                 liftIO $ Upload.uploadBytes uploader tarName tarBytes
                 when shouldSign
-                  (Sig.signTarBytes sigServiceUrl tarName tarBytes)
+                  (do env <- getMinimalEnvOverride
+                      Sig.signTarBytes sigServiceUrl tarName tarBytes)
 
 sdistCmd :: [String] -> GlobalOpts -> IO ()
 sdistCmd dirs go =
@@ -884,22 +886,20 @@ imgDockerCmd () go@GlobalOpts{..} = do
         (Just Image.createContainerImageFromStage)
 
 sigSignSdistCmd :: (String, String) -> GlobalOpts -> IO ()
-sigSignSdistCmd (url,path) go@GlobalOpts{..} = do
-    (manager,lc) <- liftIO $ loadConfigWithOpts go
-    runStackTGlobal
-        manager
-        (lcConfig lc)
+sigSignSdistCmd (url,path) go = do
+    withConfigAndLock
         go
-        (Sig.sign url path)
+        (do (manager,lc) <- liftIO (loadConfigWithOpts go)
+            env <- getMinimalEnvOverride
+            runStackTGlobal manager (lcConfig lc) go (Sig.sign url path))
 
 sigSignHackageCmd :: (String, String) -> GlobalOpts -> IO ()
-sigSignHackageCmd (url,user) go@GlobalOpts{..} = do
-    (manager,lc) <- liftIO $ loadConfigWithOpts go
-    runStackTGlobal
-        manager
-        (lcConfig lc)
+sigSignHackageCmd (url,user) go =
+    withConfigAndLock
         go
-        (Sig.signAll url user)
+        (do (manager,lc) <- liftIO $ loadConfigWithOpts go
+            env <- getMinimalEnvOverride
+            runStackTGlobal manager (lcConfig lc) go (Sig.signAll env url user))
 
 -- | Load the configuration with a manager. Convenience function used
 -- throughout this module.
